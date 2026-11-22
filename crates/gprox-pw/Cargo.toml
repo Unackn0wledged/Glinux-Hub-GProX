@@ -1,0 +1,18 @@
+[package]
+name = "gprox-pw"
+description = "PipeWire nodes, linking, device discovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gprox-dsp.workspace = true
+pipewire.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

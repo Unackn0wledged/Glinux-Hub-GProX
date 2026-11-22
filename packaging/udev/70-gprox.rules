@@ -1,0 +1,12 @@
+# gprox: let the logged-in user open the Logitech PRO X Wireless dongle's
+# HID++ interface (sidetone, auto-off, battery, mute status).
+#
+# Only the dongle 046d:0aba, only its hidraw node (interface 3). The "uaccess"
+# tag gives the user at the active seat an ACL on the node; it must be set
+# before 73-seat-late.rules, hence the 70- prefix.
+#
+# The Arch package installs it to /usr/lib/udev/rules.d/ (pacman's udev hook
+# reloads and triggers). By hand: copy to /etc/udev/rules.d/, then
+#   sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
+# ID_USB_INTERFACE_NUM is set for hidraw by 60-persistent-hidraw.rules.
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="0aba", ENV{ID_USB_INTERFACE_NUM}=="03", TAG+="uaccess"

@@ -1,0 +1,28 @@
+[package]
+name = "gprox-cli"
+description = "Scripting/debug CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gprox"
+path = "src/main.rs"
+
+[dependencies]
+gprox-core.workspace = true
+gprox-ghub.workspace = true
+gprox-hid.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

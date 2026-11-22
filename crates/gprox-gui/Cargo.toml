@@ -1,0 +1,22 @@
+[package]
+name = "gprox-gui"
+description = "egui front-end"
+version.workspace = true
+edition.workspace = true
+# eframe 0.37 needs Rust 1.95 (host toolchain: 1.100).
+rust-version = "1.95"
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gprox-gui"
+path = "src/main.rs"
+
+[dependencies]
+gprox-core.workspace = true
+gprox-dsp.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+
+[lints]
+workspace = true

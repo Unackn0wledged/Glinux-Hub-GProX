@@ -1,0 +1,33 @@
+# gprox daemon as a systemd user service.
+#
+# The Arch package enables it for every user (systemctl --global enable, the
+# way PipeWire's own units are enabled), so it starts at login. Opt out per
+# user with: systemctl --user mask gproxd.service
+#
+# Like PipeWire's filter-chain.service: started after PipeWire and the session
+# manager, stopped with PipeWire (BindsTo) and started again whenever PipeWire
+# starts (WantedBy=pipewire.service), so a PipeWire restart doesn't leave
+# gproxd holding a dead connection. Logs go to the journal:
+#   journalctl --user -u gproxd
+[Unit]
+Description=gprox: PRO X Wireless headphone EQ, Blue VO!CE mic chain and headset controls
+Documentation=file:///usr/share/doc/gprox/README.md
+After=pipewire.service pipewire-session-manager.service
+BindsTo=pipewire.service
+
+[Service]
+Type=simple
+# No periodic stats lines in the journal (gproxd --help for the other flags).
+ExecStart=/usr/bin/gproxd --stats-interval 0
+Restart=on-failure
+RestartSec=2
+Slice=session.slice
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=default.target pipewire.service

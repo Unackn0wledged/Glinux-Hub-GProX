@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=gprox
+GenericName=Headset Settings
+Comment=PRO X Wireless headphone EQ, Blue VO!CE mic chain and headset controls
+Exec=gprox-gui
+Icon=audio-headset
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=headset;equalizer;EQ;microphone;Blue VO!CE;sidetone;battery;Logitech;
+StartupNotify=true

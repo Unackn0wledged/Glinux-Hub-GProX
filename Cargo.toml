@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/gprox-core",
+    "crates/gprox-dsp",
+    "crates/gprox-pw",
+    "crates/gprox-hid",
+    "crates/gprox-ghub",
+    "crates/gprox-daemon",
+    "crates/gprox-gui",
+    "crates/gprox-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Unackn0wledged/Glinux-Hub-GProX"
+
+[workspace.dependencies]
+gprox-dsp = { path = "crates/gprox-dsp" }
+gprox-pw = { path = "crates/gprox-pw" }
+gprox-core = { path = "crates/gprox-core" }
+gprox-ghub = { path = "crates/gprox-ghub" }
+gprox-hid = { path = "crates/gprox-hid" }
+
+# PipeWire 1.x on the host (1.6.11); v1_0_0 enables the TRIGGER stream flag and Buffer::requested.
+pipewire = { version = "0.10", features = ["v1_0_0"] }
+bytemuck = "1"
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+# System libsqlite3 (pkg-config); 0.40 is the newest with rust-version <= 1.85.
+rusqlite = "0.40"
+tempfile = "3"
+
+[workspace.lints.rust]
+# No unsafe outside the gprox-pw/gprox-hid FFI wrappers. Those crates
+# override this locally if (and only if) they need an FFI wrapper; each use is documented.
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+debug = 1

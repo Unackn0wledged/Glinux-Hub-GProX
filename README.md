@@ -1,0 +1,180 @@
+# Glinux Hub - GProX
+
+A native Linux replacement for Logitech G HUB's audio features on the **Logitech G PRO X Wireless** headset (USB dongle
+`046d:0aba`). It runs G HUB's headphone EQ and the Blue VO!CE microphone chain as PipeWire nodes and controls the headset
+itself (sidetone, auto-off, battery, mic mute), so the headset sounds and behaves on Linux as it does under G HUB on Windows.
+
+Unofficial and not affiliated with Logitech. No Logitech code, binaries or data are included: presets and the battery model
+are read at run time from your own G HUB installation.
+
+## Features
+
+- **Headphone EQ**: G HUB's 10-band "advanced" and 2-band "basic" EQ with its presets. The output is bit-exact with G HUB's,
+  including the 100 ms gain ramps.
+- **Blue VO!CE mic chain**: voice EQ, de-popper, noise reduction, expander/gate, de-esser, compressor and limiter, with all of
+  G HUB's Blue VO!CE presets and your own. It matches G HUB's engine to within −83 to −101 dB, far below audibility.
+- **Your G HUB presets**: imports every headphone EQ and Blue VO!CE preset from G HUB's settings database, including ones you
+  made or downloaded.
+- **Headset controls**: sidetone level, auto-off timer, battery level and remaining time, mic mute state, and recovery when the
+  dongle is re-plugged or the headset is switched off and on.
+- **Tray widget for KDE Plasma 6**, a small GUI and a command-line tool. Changes apply live, without dropouts.
+- **Packaged for Arch / CachyOS**: a systemd user service starts it at login and makes it the default output and input.
+
+## How it works
+
+```text
+ apps ──► "PRO X (gprox)" sink ──► headphone EQ ─────────► headset (USB audio)
+ apps ◄── "PRO X Mic (gprox)"  ◄── Blue VO!CE chain ◄───── headset mic
+
+ gproxd ── HID++ ──► dongle: sidetone, auto-off, battery, mute
+   ▲
+   └── control socket ◄── gprox (CLI) · gprox-gui · Plasma tray widget
+```
+
+`gproxd` is a user daemon. It creates a virtual sink and source in PipeWire, processes audio in real time (no allocations, locks
+or system calls on the audio thread), talks HID++ to the headset dongle, and serves a local control socket
+(`$XDG_RUNTIME_DIR/gprox/control.sock`, your user only). The CLI, the GUI and the tray widget are clients of that socket.
+
+| Crate | Purpose |
+|---|---|
+| `gprox-dsp` | The DSP: headphone EQ, Blue VO!CE blocks, noise reduction |
+| `gprox-pw` | PipeWire virtual sink/source |
+| `gprox-hid` | HID++ headset control, with an allow-list of the commands G HUB sends (firmware commands are blocked in code) |
+| `gprox-ghub` | Reading G HUB's preset files and settings database |
+| `gprox-core` | Preset formats and the control protocol |
+| `gprox-daemon` | `gproxd` |
+| `gprox-cli`, `gprox-gui` | `gprox` and `gprox-gui` |
+
+## Install (Arch / CachyOS)
+
+You need a Rust toolchain (`rustup` package), `clang` and PipeWire with WirePlumber.
+
+```bash
+git clone https://github.com/Unackn0wledged/Glinux-Hub-GProX.git
+```
+
+```bash
+cd Glinux-Hub-GProX/packaging/arch && makepkg -si
+```
+
+This installs `gproxd`, `gprox`, `gprox-gui`, the systemd user service (enabled for all users, so it starts at login), a udev
+rule that lets you access the headset dongle, and the Plasma tray widget. Start it now without logging out:
+
+```bash
+systemctl --user start gproxd
+```
+
+Other distributions: `cargo build --release`, then install the files under `packaging/` by hand.
+
+## Setup
+
+gprox needs two files from your own G HUB installation: the Blue VO!CE presets and the battery model. Copy the folder
+`C:\ProgramData\LGHUB\depots\<number>\pro_headset` from Windows, then:
+
+```bash
+gprox setup /path/to/pro_headset
+```
+
+```bash
+systemctl --user restart gproxd
+```
+
+This copies the two files to `~/.config/gprox/` and makes **PRO X (gprox)** and **PRO X Mic (gprox)** your default output
+and input. Without it, the headphone EQ and headset controls still work, the mic is passed through unprocessed, and the
+battery shows in volts.
+
+To bring over your own presets, copy `settings.db` and `settings.db-wal` from `%LOCALAPPDATA%\LGHUB\` (with G HUB closed):
+
+```bash
+gprox import ghub /path/to/folder-with-settings.db
+```
+
+## Usage
+
+- **Tray widget**: right-click the system tray → **Configure System Tray…** → **Entries** → **gprox Headset** → **Always
+  shown**. The popup shows the battery, output and mic volume, the EQ and Blue VO!CE presets, sidetone, auto-off and the mute
+  state. If `~/.config/gprox/headset.png` exists, it is shown as the headset picture.
+- **GUI**: `gprox-gui` ("gprox" in the application menu) has the preset pickers, the headphone EQ curve and the headset
+  controls.
+- **CLI**:
+
+```bash
+gprox status
+```
+
+```bash
+gprox preset list
+```
+
+```bash
+gprox preset set bass
+```
+
+```bash
+gprox bluevoice set "broadcaster 1"
+```
+
+```bash
+gprox bluevoice off
+```
+
+```bash
+gprox sidetone 30
+```
+
+```bash
+gprox auto-off 15
+```
+
+Headphone EQ presets are TOML files in `~/.config/gprox/hp-eq/` (the file name is the preset name; `flat` is always there,
+and `gprox import ghub` adds G HUB's and your own). For example `~/.config/gprox/hp-eq/bass.toml`:
+
+```toml
+mode = "basic"        # or "advanced"
+basic = [6.0, -3.0]   # bass and treble shelves, dB
+# advanced = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]   # 32 Hz … 16 kHz, ±12 dB
+```
+
+Notes:
+- The mic mute state is best effort: the headset doesn't report it, so gprox counts presses of the mute button and treats any
+  mic audio as live. It shows "unknown" until the mic has been used once.
+- Logs: `journalctl --user -u gproxd`. Turn gprox off for your user: `systemctl --user mask --now gproxd`. When gproxd stops,
+  audio falls back to the headset directly.
+
+## How it was built
+
+G HUB was analysed in a Windows 11 virtual machine and never run on Linux. Each part was studied, written up as a
+specification in our own words, re-implemented from scratch in Rust, and then checked against reference recordings of G HUB's
+own output:
+
+1. **USB traffic** between G HUB and the dongle was captured with `usbmon` and Wireshark. This gave the HID++ commands for
+   sidetone, auto-off and battery, and the audio formats.
+2. **Static analysis** of G HUB's audio processing objects (the Windows APOs that run inside `audiodg.exe`) in Ghidra showed
+   the structure of the EQ and the Blue VO!CE engine: filter designs, dynamics, noise reduction and parameter mapping.
+3. **Dynamic analysis** with Frida: hooks inside the Windows audio engine logged parameters, filter coefficients and the audio
+   going in and out. A small harness drove the Blue VO!CE engine on its own with test signals. These recordings became the
+   golden tests: the headphone EQ is bit-exact, and the full mic chain is within −83 to −101 dB of G HUB.
+4. G HUB's preset files and settings database (SQLite holding protobuf-style JSON) were decoded to import presets.
+
+Tools: Ghidra, Frida, Wireshark/usbmon, QEMU/KVM with virt-manager, Python and NumPy for analysis, Rust for the
+implementation, Qt/QML for the tray widget. Analysis and implementation were done with AI assistance (Claude Code).
+
+The reverse engineering was done only to make this independent program interoperable with the headset and G HUB's presets
+(as permitted by EU Directive 2009/24/EC, Art. 6). The specifications, recordings and G HUB files used during development are
+not part of this repository.
+
+## Development
+
+```bash
+bash tools/ci.sh
+```
+
+This runs `cargo fmt`, `clippy` and the tests. The golden tests compare against reference recordings of G HUB's output, which
+are not distributed; without them those tests skip and the rest run normally.
+
+## License
+
+GPL-3.0-or-later, see [LICENSE](LICENSE).
+
+Logitech, G HUB, PRO X and Blue VO!CE are trademarks of Logitech. They are used here only to describe what this software
+works with.
