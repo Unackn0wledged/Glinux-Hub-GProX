@@ -1,0 +1,73 @@
+# Maintainer: Unackn0wledged <321775667+Unackn0wledged@users.noreply.github.com>
+#
+# AUR package: builds a tagged release from GitHub. No G HUB data is packaged;
+# `gprox setup` copies it from the user's own G HUB install after installing.
+
+pkgname=gprox
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Headphone EQ, Blue VO!CE mic chain and headset controls for the Logitech PRO X Wireless (G HUB replacement)'
+arch=('x86_64')
+url='https://github.com/Unackn0wledged/Glinux-Hub-GProX'
+license=('GPL-3.0-or-later')
+depends=(
+  gcc-libs
+  glibc
+  libglvnd        # gprox-gui (OpenGL, loaded at run time)
+  libpipewire
+  libxkbcommon    # gprox-gui
+  pipewire
+  sqlite
+  wayland         # gprox-gui
+  wireplumber
+)
+makedepends=(cargo clang pkgconf)
+optdepends=(
+  'plasma-workspace: tray widget (KDE Plasma 6)'
+  'plasma-pa: tray widget volume sliders'
+  'libx11: gprox-gui on X11'
+  'libxcursor: gprox-gui on X11'
+  'libxi: gprox-gui on X11'
+  'libxrandr: gprox-gui on X11'
+)
+install=gprox.install
+_src=Glinux-Hub-GProX-$pkgver
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('43da1844badeaa87a704a8164dfde9d0392163a7c527a084a5defc071a9010f9')
+
+prepare() {
+  cd "$_src"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+  cd "$_src"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  # Keep build paths (panic locations) out of the binaries.
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/usr/src/gprox --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+  cargo build --release --locked --offline
+}
+
+check() {
+  cd "$_src"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo test --release --locked --offline --workspace
+}
+
+package() {
+  cd "$_src"
+  install -Dm755 -t "$pkgdir/usr/bin" target/release/{gproxd,gprox,gprox-gui}
+  install -Dm644 -t "$pkgdir/usr/lib/systemd/user" packaging/systemd/gproxd.service
+  install -Dm644 -t "$pkgdir/usr/lib/udev/rules.d" packaging/udev/70-gprox.rules
+  install -Dm644 -t "$pkgdir/usr/share/applications" packaging/desktop/gprox.desktop
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" README.md
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  # Tray widget (Plasma 6 system tray). Plasma loads it itself; the user turns
+  # it on once in System Tray Settings.
+  local _w=packaging/plasma/org.gprox.tray _d="$pkgdir/usr/share/plasma/plasmoids/org.gprox.tray"
+  install -Dm644 -t "$_d" "$_w/metadata.json"
+  install -Dm644 -t "$_d/contents/config" "$_w"/contents/config/*
+  install -Dm644 -t "$_d/contents/ui" "$_w"/contents/ui/*.qml
+}

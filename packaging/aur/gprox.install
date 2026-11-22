@@ -1,0 +1,26 @@
+# Enable gproxd for every user's session, as Arch does for PipeWire's own user
+# units. A user opts out with: systemctl --user mask gproxd.service
+
+post_install() {
+  systemctl --global enable gproxd.service
+  cat <<'MSG'
+==> gprox: gproxd starts at your next login. To start it now:
+==>     systemctl --user start gproxd
+==> One-time setup (Blue VO!CE presets and battery percentage from your own
+==> G HUB install, and gprox as the default output and input):
+==>     gprox setup /path/to/LGHUB/depots/<number>/pro_headset
+==> Your own G HUB presets: gprox import ghub /path/to/settings.db
+MSG
+}
+
+post_upgrade() {
+  echo '==> gprox: restart the daemon to use the new version: systemctl --user restart gproxd'
+}
+
+pre_remove() {
+  systemctl --global disable gproxd.service
+}
+
+post_remove() {
+  echo '==> gprox: stop a running daemon with: systemctl --user stop gproxd'
+}
