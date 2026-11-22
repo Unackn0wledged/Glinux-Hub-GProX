@@ -40,17 +40,36 @@ or system calls on the audio thread), talks HID++ to the headset dongle, and ser
 
 ## Install (Arch / CachyOS)
 
-You need a Rust toolchain (`rustup` package), `clang` and PipeWire with WirePlumber.
+An AUR package is coming. Until then, pick one of these.
+
+**Prebuilt package** (fastest, no compiling). Download it from the
+[latest release](https://github.com/Unackn0wledged/Glinux-Hub-GProX/releases/latest) and install the downloaded file:
+
+```bash
+curl -LO https://github.com/Unackn0wledged/Glinux-Hub-GProX/releases/download/v0.1.0/gprox-0.1.0-1-x86_64.pkg.tar.zst
+```
+
+```bash
+sudo pacman -U gprox-0.1.0-1-x86_64.pkg.tar.zst
+```
+
+The release notes list the package's SHA-256 checksum, so you can check the download with `sha256sum` first.
+
+**Build the release from source.** Needs `rustup`, `clang` and `pkgconf`. The PKGBUILD downloads the tagged release
+and verifies its checksum:
 
 ```bash
 git clone https://github.com/Unackn0wledged/Glinux-Hub-GProX.git
 ```
 
 ```bash
-cd Glinux-Hub-GProX/packaging/arch && makepkg -si
+cd Glinux-Hub-GProX/packaging/aur && makepkg -si
 ```
 
-This installs `gproxd`, `gprox`, `gprox-gui`, the systemd user service (enabled for all users, so it starts at login), a udev
+To build the latest development version instead, use `packaging/arch` the same way. It builds the commit you have
+checked out.
+
+Either way, this installs `gproxd`, `gprox`, `gprox-gui`, the systemd user service (enabled for all users, so it starts at login), a udev
 rule that lets you access the headset dongle, and the Plasma tray widget. Start it now without logging out:
 
 ```bash
