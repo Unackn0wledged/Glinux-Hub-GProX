@@ -1,9 +1,10 @@
 //! Per-sample biquad cascade kernels.
 //!
 //! The headphone EQ is generic over [`CascadeKernel`]. Two kernels exist:
-//! * [`IppF32`]: G HUB's Intel IPP single-precision biquad kernel,
-//!   re-implemented from its observed arithmetic. It is bit-exact with the hooked G HUB output
-//!   when run on G HUB's block grid (480 frames at 48 kHz from stream start).
+//! * [`IppF32`]: G HUB's Intel IPP single-precision biquad kernel, written
+//!   from our own description of its arithmetic, which was worked out from
+//!   the disassembly. It is bit-exact with recorded G HUB output when run on
+//!   G HUB's block grid (480 frames at 48 kHz from stream start).
 //!   This is the default.
 //! * [`Tdf2F64Acc`]: a clean transposed direct form II with `f64` arithmetic,
 //!   kept as a reference (about −49 dB from G HUB on LF-heavy material).

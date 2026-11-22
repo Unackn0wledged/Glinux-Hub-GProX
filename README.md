@@ -2,17 +2,19 @@
 
 A native Linux replacement for Logitech G HUB's audio features on the **Logitech G PRO X Wireless** headset (USB dongle
 `046d:0aba`). It runs G HUB's headphone EQ and the Blue VO!CE microphone chain as PipeWire nodes and controls the headset
-itself (sidetone, auto-off, battery, mic mute), so the headset sounds and behaves on Linux as it does under G HUB on Windows.
+itself (sidetone, auto-off, battery, mic mute), with the aim of sounding and behaving on Linux as it does under G HUB on Windows.
 
-Unofficial and not affiliated with Logitech. No Logitech code, binaries or data are included: presets and the battery model
-are read at run time from your own G HUB installation.
+Unofficial and not affiliated with Logitech. No Logitech code, binaries, preset files or battery model
+are included; presets and the battery model are read at run time from your own G HUB installation. The source does contain
+numeric constants of G HUB's algorithms, its default Blue VO!CE parameter values, and the values of one preset (Broadcaster 1)
+that the tests use.
 
 ## Features
 
-- **Headphone EQ**: G HUB's 10-band "advanced" and 2-band "basic" EQ with its presets. The output is bit-exact with G HUB's,
-  including the 100 ms gain ramps.
+- **Headphone EQ**: G HUB's 10-band "advanced" and 2-band "basic" EQ with its presets. The output is bit-exact with
+  G HUB's in the two recorded test sequences (48 kHz), including the 100 ms gain ramps.
 - **Blue VO!CE mic chain**: voice EQ, de-popper, noise reduction, expander/gate, de-esser, compressor and limiter, with all of
-  G HUB's Blue VO!CE presets and your own. It matches G HUB's engine to within −83 to −101 dB, far below audibility.
+  G HUB's Blue VO!CE presets and your own. See [How close is it?](#how-close-is-it) for measurements.
 - **Your G HUB presets**: imports every headphone EQ and Blue VO!CE preset from G HUB's settings database, including ones you
   made or downloaded.
 - **Headset controls**: sidetone level, auto-off timer, battery level and remaining time, mic mute state, and recovery when the
@@ -162,18 +164,31 @@ own output:
 1. **USB traffic** between G HUB and the dongle was captured with `usbmon` and Wireshark. This gave the HID++ commands for
    sidetone, auto-off and battery, and the audio formats.
 2. **Static analysis** of G HUB's audio processing objects (the Windows APOs that run inside `audiodg.exe`) in Ghidra showed
-   the structure of the EQ and the Blue VO!CE engine: filter designs, dynamics, noise reduction and parameter mapping.
+   the structure of the EQ and the Blue VO!CE engine: filter designs, dynamics, noise reduction and parameter mapping. The
+   exact arithmetic of the EQ's filter routine was worked out from its disassembly.
 3. **Dynamic analysis** with Frida: hooks inside the Windows audio engine logged parameters, filter coefficients and the audio
    going in and out. A small harness drove the Blue VO!CE engine on its own with test signals. These recordings became the
-   golden tests: the headphone EQ is bit-exact, and the full mic chain is within −83 to −101 dB of G HUB.
+   golden tests (see [How close is it?](#how-close-is-it)).
 4. G HUB's preset files and settings database (SQLite holding protobuf-style JSON) were decoded to import presets.
 
 Tools: Ghidra, Frida, Wireshark/usbmon, QEMU/KVM with virt-manager, Python and NumPy for analysis, Rust for the
 implementation, Qt/QML for the tray widget. Analysis and implementation were done with AI assistance (Claude Code).
 
-The reverse engineering was done only to make this independent program interoperable with the headset and G HUB's presets
-(as permitted by EU Directive 2009/24/EC, Art. 6). The specifications, recordings and G HUB files used during development are
+The purpose of the reverse engineering was to make this independent program work with the headset and with G HUB's presets.
+The specifications, recordings and G HUB files used during development are
 not part of this repository.
+
+## How close is it?
+
+- **Headphone EQ:** bit-exact with G HUB's recorded output in two sequences (a stream start, and a preset change while playing),
+  at 48 kHz and several buffer sizes.
+- **Blue VO!CE, single modules:** driven with the same test signals as G HUB's own engine, most are bit-exact; the rest differ by
+  −102 dB or less.
+- **Blue VO!CE, full chain:** on 8 seconds of recorded speech, −89, −83 and −101 dB from G HUB's engine for Broadcaster 1, FM Station
+  and AM Radio. Other presets have not been measured.
+- **Against G HUB running live on Windows:** one recording, Broadcaster 1, the same 8 seconds of speech: −68 dB overall and −54 dB in
+  the worst second. Driving G HUB's engine on its own differs from the live recording by the same amount; the cause is not known.
+- **Not measured:** switching modules on and off mid-stream, and sample rates other than 48 kHz.
 
 ## Development
 
