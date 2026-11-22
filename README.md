@@ -20,16 +20,9 @@ are read at run time from your own G HUB installation.
 - **Tray widget for KDE Plasma 6**, a small GUI and a command-line tool. Changes apply live, without dropouts.
 - **Packaged for Arch / CachyOS**: a systemd user service starts it at login and makes it the default output and input.
 
+![The tray widget in Plasma's light and dark themes](docs/tray.png)
+
 ## How it works
-
-```text
- apps ──► "PRO X (gprox)" sink ──► headphone EQ ─────────► headset (USB audio)
- apps ◄── "PRO X Mic (gprox)"  ◄── Blue VO!CE chain ◄───── headset mic
-
- gproxd ── HID++ ──► dongle: sidetone, auto-off, battery, mute
-   ▲
-   └── control socket ◄── gprox (CLI) · gprox-gui · Plasma tray widget
-```
 
 `gproxd` is a user daemon. It creates a virtual sink and source in PipeWire, processes audio in real time (no allocations, locks
 or system calls on the audio thread), talks HID++ to the headset dongle, and serves a local control socket
