@@ -10,12 +10,19 @@
 //! Headset controls: a [`gprox_hid::HeadsetService`] thread talks HID++
 //! to the dongle (sidetone, auto-off, battery, hotplug, mute-button reports);
 //! the capture path reports when the raw mic last had audio and when its
-//! stream started, which the mute tracking needs (`gprox_hid::mute`).
+//! stream started, which the mute tracking needs (`gprox_hid::mute`), and a
+//! [`gprox_pw::NodeWatch`] reports when the headset's own devices start or
+//! stop streaming (the dongle sends a stray mute report then).
+//!
+//! Always-on sidetone ([`sidetone`]): while the setting is
+//! on, a keep-alive stream holds the headset mic open, because the headset
+//! only mixes sidetone while its capture stream runs.
 
 mod control;
+mod sidetone;
 mod state;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -27,7 +34,7 @@ use clap::Parser;
 use gprox_core::control::{Request, Response};
 use gprox_core::{BlueVoicePreset, HeadphoneEqPreset};
 use gprox_dsp::bluevoice::BlueVoice;
-use gprox_dsp::silence::{SilenceMeter, silence_meter};
+use gprox_dsp::silence::{SilenceMeter, silence_meter, silence_meter_source};
 use gprox_dsp::{HeadphoneEq, Passthrough, Processor};
 use gprox_pw::{Direction, Duplex, DuplexSpec, StatsSnapshot, position};
 use pipewire as pw;
@@ -63,8 +70,9 @@ struct Args {
     /// Requested quantum in frames.
     #[arg(long, default_value_t = 256)]
     quantum: u32,
-    /// Processing rate in Hz.
-    #[arg(long, default_value_t = 48_000)]
+    /// Processing rate in Hz: 48000 (G HUB's, the one verified against it)
+    /// or 44100. The Blue VO!CE filters and NR bands are made for these.
+    #[arg(long, default_value_t = 48_000, value_parser = parse_rate)]
     rate: u32,
     /// Seconds between stats log lines (0 = off).
     #[arg(long, default_value_t = 10)]
@@ -139,6 +147,14 @@ impl Processor for Capture {
     }
 }
 
+/// `--rate`: only the rates the DSP is made for.
+fn parse_rate(s: &str) -> Result<u32, String> {
+    match s.parse::<u32>() {
+        Ok(r @ (44_100 | 48_000)) => Ok(r),
+        _ => Err(format!("{s:?}: use 48000 or 44100")),
+    }
+}
+
 /// Render-path DSP chain (boxed: the EQ state is large).
 struct RenderChain(Box<HeadphoneEq>);
 
@@ -153,13 +169,21 @@ impl Processor for RenderChain {
 }
 
 /// Blue VO!CE presets from G HUB's device preset file, in gprox form.
+/// Presets with values gprox can't use are skipped with a warning.
 fn read_bluevoice_presets(path: &std::path::Path) -> anyhow::Result<Vec<BlueVoicePreset>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let presets = gprox_ghub::bluevoice_presets(&text)
         .with_context(|| format!("G HUB presets {}", path.display()))?;
     Ok(presets
         .iter()
-        .map(gprox_ghub::BlueVoicePreset::to_core)
+        .filter_map(|p| match p.to_core() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(file = %path.display(), preset = %p.name, error = %e,
+                    "skipping Blue VO!CE preset");
+                None
+            }
+        })
         .collect())
 }
 
@@ -298,6 +322,100 @@ fn config_dir(args: &Args) -> anyhow::Result<PathBuf> {
     }
 }
 
+fn socket(args: &Args) -> anyhow::Result<PathBuf> {
+    match &args.socket {
+        Some(p) => Ok(p.clone()),
+        None => Ok(gprox_core::control::socket_path()?),
+    }
+}
+
+/// Exclusive locks that make gproxd single-instance. Held for the
+/// process lifetime; the kernel drops them when the process ends, so a crash
+/// leaves nothing stale behind.
+#[derive(Debug)]
+struct InstanceLock(#[allow(dead_code)] Vec<std::fs::File>);
+
+/// Lock `gproxd.lock` in the config directory (state.toml's owner) and in the
+/// socket's directory, before anything is read, written or opened: a second
+/// gproxd stops here instead of rewriting state.toml, opening the dongle or
+/// racing for the socket.
+fn instance_lock(args: &Args) -> anyhow::Result<InstanceLock> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let socket = socket(args)?;
+    let mut dirs = vec![config_dir(args)?];
+    dirs.extend(socket.parent().map(Path::to_owned));
+    dirs.dedup();
+    let mut files = Vec::new();
+    for dir in dirs {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("create {}", dir.display()))?;
+        let path = dir.join("gproxd.lock");
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        match rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => files.push(f),
+            Err(rustix::io::Errno::WOULDBLOCK) => anyhow::bail!(
+                "another gproxd is running (it holds {}); stop it first, or use `gprox` to \
+                 change its settings",
+                path.display()
+            ),
+            Err(e) => return Err(e).with_context(|| format!("lock {}", path.display())),
+        }
+    }
+    Ok(InstanceLock(files))
+}
+
+/// Blue VO!CE presets: G HUB's built-in ones first, then imported ones not
+/// already listed.
+fn all_bluevoice_presets(files: &GhubFiles, config_dir: &Path) -> Vec<BlueVoicePreset> {
+    // A damaged G HUB file must not stop gproxd: the imported presets and
+    // the EQ work without it.
+    let mut presets = match &files.presets {
+        Some(p) => read_bluevoice_presets(p).unwrap_or_else(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "G HUB Blue VO!CE presets not used");
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+    for p in read_bluevoice_dir(&config_dir.join("bluevoice")) {
+        if !presets.iter().any(|q| control::bv_matches(q, &p.name)) {
+            presets.push(p);
+        }
+    }
+    presets
+}
+
+/// `--list-bluevoice`: the preset names. Read-only (no lock, nothing saved),
+/// so it also works while gproxd runs.
+fn list_bluevoice(args: &Args) -> anyhow::Result<Vec<String>> {
+    let config_dir = config_dir(args)?;
+    let st = State::load(&config_dir.join("state.toml"));
+    let files = ghub_files(args, &st, &config_dir);
+    let presets = all_bluevoice_presets(&files, &config_dir);
+    if presets.is_empty() {
+        anyhow::bail!(
+            "no Blue VO!CE presets: run `gprox setup <G HUB folder>`, pass --ghub-presets <file> or run `gprox import ghub`"
+        );
+    }
+    Ok(presets.into_iter().map(|p| p.name).collect())
+}
+
+/// Take the instance lock, then build the controller.
+fn start(args: &Args) -> anyhow::Result<(InstanceLock, Controller, GhubFiles)> {
+    let lock = instance_lock(args)?;
+    let (ctl, files) = controller(args)?;
+    Ok((lock, ctl, files))
+}
+
 /// Build the controller from the saved state and the command line.
 fn controller(args: &Args) -> anyhow::Result<(Controller, GhubFiles)> {
     let config_dir = config_dir(args)?;
@@ -310,18 +428,9 @@ fn controller(args: &Args) -> anyhow::Result<(Controller, GhubFiles)> {
     if let Some(p) = &args.battery_model {
         st.battery_model = Some(std::path::absolute(p).context("--battery-model path")?);
     }
-    // G HUB's built-in presets first, then imported ones not already listed.
-    let mut presets = match &files.presets {
-        Some(p) => read_bluevoice_presets(p)?,
-        None => Vec::new(),
-    };
-    for p in read_bluevoice_dir(&config_dir.join("bluevoice")) {
-        if !presets.iter().any(|q| control::bv_matches(q, &p.name)) {
-            presets.push(p);
-        }
-    }
+    let presets = all_bluevoice_presets(&files, &config_dir);
     let bv_presets = if presets.is_empty() {
-        if args.bluevoice.is_some() || args.list_bluevoice {
+        if args.bluevoice.is_some() {
             anyhow::bail!(
                 "no Blue VO!CE presets: run `gprox setup <G HUB folder>`, pass --ghub-presets <file> or run `gprox import ghub`"
             );
@@ -368,18 +477,26 @@ fn main() -> anyhow::Result<()> {
         log.init();
     }
     let args = Args::parse();
-    let (mut ctl, ghub) = controller(&args)?;
     if args.list_bluevoice {
-        for p in ctl.status().bluevoice.presets {
+        for p in list_bluevoice(&args)? {
             println!("{p}");
         }
         return Ok(());
     }
+    let (_lock, mut ctl, ghub) = start(&args)?;
 
     // DSP with lock-free parameter handles for the controller.
     let (eq, hp_handle) = HeadphoneEq::new_shared(&ctl.hp_settings());
     let render_dsp = RenderChain(Box::new(eq));
-    let (chain, bv_handle) = match ctl.bv_params().transpose()? {
+    // Controller::new already falls back to "off" for a refused saved preset;
+    // never let the capture parameters stop the start.
+    let bv = ctl.bv_params().map(|r| {
+        r.unwrap_or_else(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "Blue VO!CE off");
+            control::bv_params(None, false).expect("the defaults are valid")
+        })
+    });
+    let (chain, bv_handle) = match bv {
         Some(p) => {
             let (bv, h) = BlueVoice::new_shared(&p);
             (CaptureChain::BlueVoice(Box::new(bv)), Some(h))
@@ -388,7 +505,16 @@ fn main() -> anyhow::Result<()> {
     };
     let (silence, mut probe) = silence_meter(args.rate);
     let capture_dsp = Capture { chain, silence };
+    // The always-on sidetone stream's own meter (it starts the dongle's
+    // capture stream too, and sees the mic while no app records).
+    let (sidetone_meters, mut sidetone_probe) = silence_meter_source(args.rate);
+    let keep_open = ctl.keep_open();
+    // Starts and stops of the headset's own streams (from PipeWire's node
+    // states, whichever app caused them): the dongle sends a stray mute
+    // report then.
+    let device_events: Arc<Mutex<gprox_hid::mute::AudioObservation>> = Arc::default();
     ctl.attach(hp_handle, bv_handle);
+    let device_events_hid = device_events.clone();
     let headset = if args.no_hid {
         None
     } else {
@@ -396,11 +522,15 @@ fn main() -> anyhow::Result<()> {
             power_model: power_model(&ghub),
             sidetone: ctl.saved_sidetone(),
             audio: Some(Box::new(move || {
-                let a = probe.poll();
-                gprox_hid::mute::AudioObservation {
+                let seen = |a: gprox_dsp::silence::MicActivity| gprox_hid::mute::AudioObservation {
                     last_audio: a.last_audio,
                     stream_started: a.stream_started,
-                }
+                    stream_stopped: None,
+                };
+                let devices = *device_events_hid.lock().unwrap_or_else(|e| e.into_inner());
+                seen(probe.poll())
+                    .and(seen(sidetone_probe.poll()))
+                    .and(devices)
             })),
             ..Default::default()
         };
@@ -411,16 +541,40 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(hp_eq = %st.hp_eq.selected, bluevoice_available = st.bluevoice.available,
         bluevoice = st.bluevoice.enabled, bluevoice_preset = ?st.bluevoice.selected,
         "selection");
-    let socket = match &args.socket {
-        Some(p) => p.clone(),
-        None => gprox_core::control::socket_path()?,
-    };
+    let socket = socket(&args)?;
     let _server = control::serve(Arc::new(Mutex::new(ctl)), &socket)?;
 
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("main loop")?;
     let context = pw::context::ContextRc::new(&mainloop, None).context("context")?;
     let core = context.connect_rc(None).context("connect to PipeWire")?;
+
+    // A dead PipeWire connection or stream ends gproxd with an error, so
+    // systemd restarts it (Restart=on-failure) instead of it answering on the
+    // control socket without any audio.
+    let failure: Rc<RefCell<Option<String>>> = Rc::default();
+    let on_fatal: gprox_pw::OnFatal = {
+        let ml = mainloop.clone();
+        let failure = failure.clone();
+        Rc::new(move |why: String| {
+            tracing::error!("{why}");
+            failure.borrow_mut().get_or_insert(why);
+            ml.quit();
+        })
+    };
+    let _core_listener = core
+        .add_listener_local()
+        .error({
+            let on_fatal = on_fatal.clone();
+            move |id, _seq, res, message| {
+                if id == pw::core::PW_ID_CORE {
+                    on_fatal(format!("PipeWire connection error {res}: {message}"));
+                } else {
+                    tracing::warn!(id, res, message, "PipeWire error");
+                }
+            }
+        })
+        .register();
 
     let render = Duplex::new(
         &core,
@@ -435,6 +589,7 @@ fn main() -> anyhow::Result<()> {
             priority: Some(NODE_PRIORITY),
         },
         render_dsp,
+        on_fatal.clone(),
     )
     .context("render path")?;
 
@@ -451,6 +606,7 @@ fn main() -> anyhow::Result<()> {
             priority: Some(NODE_PRIORITY),
         },
         capture_dsp,
+        on_fatal,
     )
     .context("capture path")?;
 
@@ -459,6 +615,39 @@ fn main() -> anyhow::Result<()> {
         quantum = args.quantum, rate = args.rate,
         "gproxd running: 'PRO X (gprox)' sink, 'PRO X Mic (gprox)' source"
     );
+
+    let _device_watch = gprox_pw::NodeWatch::new(
+        &core,
+        vec![args.source_target.clone(), args.sink_target.clone()],
+        Rc::new(move |name: &str, edge| {
+            tracing::debug!(node = %name, ?edge, "headset stream");
+            let now = std::time::Instant::now();
+            let mut e = device_events.lock().unwrap_or_else(|e| e.into_inner());
+            match edge {
+                gprox_pw::StreamEdge::Started => e.stream_started = Some(now),
+                gprox_pw::StreamEdge::Stopped => e.stream_stopped = Some(now),
+            }
+        }),
+    )
+    .context("watch the headset nodes")?;
+
+    // Always-on sidetone: follow the setting once a second.
+    let sidetone = Rc::new(RefCell::new(sidetone::SidetoneStream::new(
+        core.clone(),
+        &args.source_target,
+        args.rate,
+        keep_open,
+        sidetone_meters,
+    )));
+    sidetone.borrow_mut().tick();
+    let sidetone_timer = mainloop.loop_().add_timer({
+        let sidetone = sidetone.clone();
+        move |_| sidetone.borrow_mut().tick()
+    });
+    sidetone_timer
+        .update_timer(Some(Duration::from_secs(1)), Some(Duration::from_secs(1)))
+        .into_result()
+        .context("arm the sidetone timer")?;
 
     let ml = mainloop.clone();
     let _sigint = mainloop
@@ -474,7 +663,14 @@ fn main() -> anyhow::Result<()> {
     let report = {
         let paths = paths.clone();
         let last = last.clone();
+        let sidetone = sidetone.clone();
+        let sidetone_last = Cell::new(0u64);
         move |_| {
+            let c = sidetone.borrow().cycles();
+            let prev = sidetone_last.replace(c);
+            if c != 0 || prev != 0 {
+                tracing::info!(cycles = c.saturating_sub(prev), "always-on sidetone stats");
+            }
             let mut prev = last.get();
             for (i, p) in paths.iter().enumerate() {
                 let s = p.stats();
@@ -519,12 +715,71 @@ fn main() -> anyhow::Result<()> {
         let s = p.stats();
         tracing::info!(path = %p.spec().name, totals = ?s, "exiting");
     }
+    if let Some(why) = failure.take() {
+        anyhow::bail!("{why}");
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_44100_and_48000_are_accepted() {
+        let rate = |r: &str| Args::try_parse_from(["gproxd", "--rate", r]).map(|a| a.rate);
+        assert_eq!(rate("48000").unwrap(), 48_000);
+        assert_eq!(rate("44100").unwrap(), 44_100);
+        for bad in ["0", "100", "8000", "96000", "x"] {
+            assert!(rate(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// A second gproxd stops before it reads or writes anything:
+    /// state.toml and the running one's socket stay untouched.
+    #[test]
+    fn second_instance_stops_before_touching_state() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("cfg");
+        let sock = d.path().join("run/control.sock");
+        std::fs::create_dir_all(cfg.join("hp-eq")).unwrap();
+        std::fs::write(cfg.join("hp-eq/Bass.toml"), "basic = [6.0, 0.0]\n").unwrap();
+        std::fs::create_dir_all(cfg.join("bluevoice")).unwrap();
+        std::fs::write(
+            cfg.join("bluevoice/Mine.toml"),
+            "[engine.micopt]\nenable = 1.0\n",
+        )
+        .unwrap();
+        let args = |extra: &[&str]| {
+            let mut v = vec![
+                "gproxd".to_owned(),
+                "--config-dir".into(),
+                cfg.display().to_string(),
+                "--socket".into(),
+                sock.display().to_string(),
+            ];
+            v.extend(extra.iter().map(|s| s.to_string()));
+            Args::try_parse_from(v).unwrap()
+        };
+        let first = start(&args(&[])).unwrap();
+        let before = std::fs::read_to_string(cfg.join("state.toml")).ok();
+        let bass = cfg.join("hp-eq/Bass.toml").display().to_string();
+        let second = start(&args(&["--hp-eq", &bass]));
+        let Err(e) = second else {
+            panic!("second instance must not start")
+        };
+        assert!(format!("{e:#}").contains("another gproxd"), "{e:#}");
+        assert_eq!(std::fs::read_to_string(cfg.join("state.toml")).ok(), before);
+        // Listing presets needs no lock and writes nothing.
+        assert_eq!(
+            list_bluevoice(&args(&["--list-bluevoice"])).unwrap(),
+            ["Mine"]
+        );
+        assert_eq!(std::fs::read_to_string(cfg.join("state.toml")).ok(), before);
+        drop(first);
+        let mut third = start(&args(&["--hp-eq", &bass])).unwrap();
+        assert_eq!(third.1.status().hp_eq.selected, "Bass");
+    }
 
     #[test]
     fn ghub_file_names_agree() {
@@ -597,6 +852,37 @@ mod tests {
         assert_eq!(f.battery, [depot.join(battery)]);
     }
 
+    /// A damaged G HUB preset file (remembered in state.toml) must not stop
+    /// gproxd: the imported presets and the EQ work without it.
+    #[test]
+    fn broken_ghub_preset_file_does_not_stop_the_start() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("cfg");
+        std::fs::create_dir_all(cfg.join("bluevoice")).unwrap();
+        std::fs::write(
+            cfg.join("bluevoice/Mine.toml"),
+            "[engine.micopt]\nenable = 1.0\n",
+        )
+        .unwrap();
+        let bad = d.path().join("presets.json");
+        for body in [
+            "{ not json",
+            r#"{"presets":[{"id":"a","name":"X","blueVoiceSettings":{"settings":{"volume":1e39}}}]}"#,
+        ] {
+            std::fs::write(&bad, body).unwrap();
+            let args = Args::try_parse_from([
+                "gproxd".as_ref(),
+                "--config-dir".as_ref(),
+                cfg.as_os_str(),
+                "--ghub-presets".as_ref(),
+                bad.as_os_str(),
+            ])
+            .unwrap();
+            let (mut ctl, _) = controller(&args).unwrap_or_else(|e| panic!("{body}: {e:#}"));
+            assert_eq!(ctl.status().bluevoice.presets, ["Mine"], "{body}");
+        }
+    }
+
     #[test]
     fn bluevoice_dir_names_by_file_and_skips_broken() {
         let d = std::env::temp_dir().join(format!("gprox-bvdir-{}", std::process::id()));
@@ -606,6 +892,9 @@ mod tests {
         std::fs::write(d.join("BG [aaaa].toml"), body).unwrap();
         std::fs::write(d.join("BG [bbbb].toml"), body).unwrap();
         std::fs::write(d.join("broken.toml"), "engine = 3").unwrap();
+        // Unknown parameter and out-of-range value.
+        std::fs::write(d.join("low_q.toml"), "[engine.veq]\nlow_q = 1.0\n").unwrap();
+        std::fs::write(d.join("zero.toml"), "[engine.veq]\nlow_width = 0.0\n").unwrap();
         std::fs::write(d.join("notes.txt"), "x").unwrap();
         let v = read_bluevoice_dir(&d);
         let names: Vec<_> = v.iter().map(|p| p.name.as_str()).collect();

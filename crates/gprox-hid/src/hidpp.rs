@@ -26,10 +26,25 @@ pub const REPORT_LEN: usize = 20;
 pub const SW_ID: u8 = 0x0B;
 
 /// Feature ids that must never be used: DFU and firmware update.
-/// [`Feature`] has no variant for them; this list exists for the tests
-/// and for rejecting a device that reports one of them where gprox expected an
-/// allowed feature.
+/// [`Feature`] has no variant for them, which is checked at compile time
+/// below. getFeature replies don't repeat the feature id, so whether a frame
+/// reaches the feature it names depends on the index map being right; the
+/// service only uses a map whose replies it could attribute
+/// ([`crate::service`], "Reply attribution").
 pub const BLOCKED_FEATURE_IDS: [u16; 6] = [0x00C0, 0x00C1, 0x00C2, 0x00C3, 0x00D0, 0x00D1];
+
+// No allowed feature is a blocked one (compile-time check).
+const _: () = {
+    let mut i = 0;
+    while i < Feature::ALL.len() {
+        let mut j = 0;
+        while j < BLOCKED_FEATURE_IDS.len() {
+            assert!(Feature::ALL[i].id() != BLOCKED_FEATURE_IDS[j]);
+            j += 1;
+        }
+        i += 1;
+    }
+};
 
 /// HID++ features gprox talks to (besides Root, index 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -216,6 +231,24 @@ impl Report {
 impl fmt::Debug for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Report({})", hex(&self.0))
+    }
+}
+
+impl Message {
+    /// A reply or error to a Root request (index 0) carrying gprox's sw_id:
+    /// a getFeature or getProtocolVersion answer, gprox's or another
+    /// client's that uses the same sw_id. Nothing in it says which request
+    /// it answers.
+    pub fn is_root_reply(&self) -> bool {
+        match *self {
+            Message::Reply {
+                index: 0, fn_sw, ..
+            }
+            | Message::Error {
+                index: 0, fn_sw, ..
+            } => fn_sw & 0x0F == SW_ID,
+            _ => false,
+        }
     }
 }
 

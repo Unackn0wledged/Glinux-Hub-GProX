@@ -76,6 +76,7 @@ Item {
         if (!autoOffCombo.popup.visible) {
             autoOffCombo.currentIndex = autoOffChoices.indexOf(st.headset.auto_off_minutes);
         }
+        alwaysOnSwitch.checked = !!st.headset.always_on_sidetone;
         if (!sidetone.pressed && !sidetoneWrite.running && st.headset.sidetone !== null
                 && st.headset.sidetone !== undefined) {
             sidetone.value = st.headset.sidetone;
@@ -524,6 +525,23 @@ Item {
                                 popup.backend.setSidetone(sidetone.value);
                             }
                         }
+                    }
+                }
+                RowLayout {
+                    // Always-on sidetone: the headset only
+                    // mixes sidetone while its mic streams; this keeps the
+                    // stream open. No HID write.
+                    Layout.fillWidth: true
+                    PC3.Label {
+                        Layout.fillWidth: true
+                        text: "Always on, even with no app using the mic"
+                        wrapMode: Text.Wrap
+                        font: Kirigami.Theme.smallFont
+                        opacity: 0.75
+                    }
+                    PC3.Switch {
+                        id: alwaysOnSwitch
+                        onToggled: popup.backend.setAlwaysOnSidetone(checked)
                     }
                 }
             }

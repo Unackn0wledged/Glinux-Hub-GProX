@@ -94,16 +94,17 @@ impl BlueVoicePreset {
     }
 
     /// As a gprox Blue VO!CE preset (engine parameters, TOML form), named by
-    /// [`short_name`](Self::short_name).
-    pub fn to_core(&self) -> gprox_core::BlueVoicePreset {
+    /// [`short_name`](Self::short_name). Fails if a value is not finite or
+    /// outside its range ([`gprox_core::PARAM_RANGES`]), e.g. from a damaged
+    /// file or a preset with a whole band missing.
+    pub fn to_core(&self) -> Result<gprox_core::BlueVoicePreset, gprox_core::BlueVoicePresetError> {
         let mut p = gprox_core::BlueVoicePreset::from_params(
             self.short_name(),
             self.params.iter().map(|&(k, v)| (k, v)),
-        )
-        .expect("engine names are <block>.<param> and values finite");
+        )?;
         p.ghub_id = (!self.id.is_empty()).then(|| self.id.clone());
         p.input_gain = self.input_gain.filter(|g| (0.0..=1.0).contains(g));
-        p
+        Ok(p)
     }
 }
 
@@ -161,8 +162,9 @@ fn lookup<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
 fn number(v: &Value) -> Option<f32> {
     match v {
         Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-        // JSON numbers are f64; G HUB sends the f32 nearest to them.
-        Value::Number(n) => n.as_f64().map(|x| x as f32),
+        // JSON numbers are f64; G HUB sends the f32 nearest to them. One
+        // beyond f32 (e.g. 1e39) would become ±inf: not a value.
+        Value::Number(n) => n.as_f64().map(|x| x as f32).filter(|x| x.is_finite()),
         _ => None,
     }
 }
@@ -282,13 +284,32 @@ mod tests {
     fn to_core_keeps_every_parameter() {
         let p = &bluevoice_presets(FIXTURE).unwrap()[0];
         assert!(p.read_only);
-        let c = p.to_core();
+        let c = p.to_core().unwrap();
         assert_eq!(c.name, "TEST_ONE");
         assert_eq!(c.ghub_id.as_deref(), Some(p.id.as_str()));
         assert_eq!(c.input_gain, Some(0.6));
         let mut ours: Vec<_> = p.params.iter().map(|&(k, v)| (k.to_owned(), v)).collect();
         ours.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(c.params(), ours);
+    }
+
+    /// JSON numbers beyond f32 (`1e39` used to become inf and panic
+    /// later) are an error for that setting, not a value.
+    #[test]
+    fn number_beyond_f32_is_an_error() {
+        for big in ["1e39", "-1e39"] {
+            let bad = FIXTURE.replace("\"makeup\": 1.5", &format!("\"makeup\": {big}"));
+            assert!(
+                matches!(
+                    bluevoice_presets(&bad),
+                    Err(Error::Setting {
+                        key: "compressor.makeup",
+                        ..
+                    })
+                ),
+                "{big}"
+            );
+        }
     }
 
     #[test]

@@ -9,7 +9,7 @@ pub mod control;
 use serde::{Deserialize, Serialize};
 
 mod bluevoice;
-pub use bluevoice::{BlueVoicePreset, BlueVoicePresetError};
+pub use bluevoice::{BlueVoicePreset, BlueVoicePresetError, PARAM_RANGES, param_range};
 
 /// `node.name` of the gprox sink apps play into ("PRO X (gprox)").
 pub const SINK_NODE: &str = "gprox_render";

@@ -13,11 +13,12 @@
 //!
 //! The same report also follows other things, which are filtered out:
 //! a write (sidetone), headset power-off/on and dongle re-plug (within
-//! ~1 s), the volume wheel (`01 01`/`01 02` presses and their releases), and
-//! the start of an audio stream after idle (seen when gproxd's mic stream
-//! starts, and in C/12 for playback). Only stream starts gproxd sees
-//! itself (its own mic stream) can be filtered; others can flip the state
-//! wrongly until the next press or the next audio.
+//! ~1 s), the volume wheel (`01 01`/`01 02` presses and their releases), the
+//! start of an audio stream after idle (seen when gproxd's mic stream starts,
+//! and for playback), and the headset's mic stream being closed (when
+//! PipeWire suspends it). gproxd reports stream starts and stops of the
+//! headset's own devices, whichever app caused them, and of its own mic
+//! streams; a report within [`STREAM_START_WINDOW`] of one is not a press.
 //!
 //! The state starts unknown and becomes known with the first audio. Toggles
 //! of an unknown state stay unknown. The state survives headset power cycles
@@ -49,8 +50,10 @@ const RELEASE: [u8; 5] = [0x01, 0, 0, 0, 0];
 pub struct AudioObservation {
     /// When the last non-zero mic sample was captured.
     pub last_audio: Option<Instant>,
-    /// When the mic stream last started after being idle.
+    /// When a headset stream last started after being idle.
     pub stream_started: Option<Instant>,
+    /// When a headset stream was last closed (device suspended).
+    pub stream_stopped: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -64,11 +67,28 @@ pub struct MuteTracker {
     wheel_until: Option<Instant>,
     last_change: Option<Instant>,
     stream_started: Option<Instant>,
+    stream_stopped: Option<Instant>,
     last_audio: Option<Instant>,
 }
 
 fn later(a: Option<Instant>, b: Instant) -> Option<Instant> {
     Some(a.map_or(b, |a| a.max(b)))
+}
+
+impl AudioObservation {
+    /// What two sources saw together (gproxd's mic path, the always-on
+    /// sidetone stream, the headset's device states): the later of each.
+    pub fn and(self, other: AudioObservation) -> AudioObservation {
+        let max = |a: Option<Instant>, b: Option<Instant>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        AudioObservation {
+            last_audio: max(self.last_audio, other.last_audio),
+            stream_started: max(self.stream_started, other.stream_started),
+            stream_stopped: max(self.stream_stopped, other.stream_stopped),
+        }
+    }
 }
 
 impl MuteTracker {
@@ -115,6 +135,9 @@ impl MuteTracker {
         if let Some(t) = obs.stream_started {
             self.stream_started = later(self.stream_started, t);
         }
+        if let Some(t) = obs.stream_stopped {
+            self.stream_stopped = later(self.stream_stopped, t);
+        }
         if let Some(t) = obs.last_audio {
             self.last_audio = later(self.last_audio, t);
         }
@@ -127,12 +150,18 @@ impl MuteTracker {
                 break;
             }
             self.pending.pop_front();
-            let near_stream_start = self.stream_started.is_some_and(|s| {
-                let d = if s > t { s - t } else { t - s };
-                d <= STREAM_START_WINDOW
-            });
-            if near_stream_start {
-                tracing::debug!("mute report next to a mic stream start: ignored");
+            let near = |e: Option<Instant>| {
+                e.is_some_and(|s| {
+                    let d = if s > t { s - t } else { t - s };
+                    d <= STREAM_START_WINDOW
+                })
+            };
+            if near(self.stream_started) {
+                tracing::debug!("mute report next to a stream start: ignored");
+                continue;
+            }
+            if near(self.stream_stopped) {
+                tracing::debug!("mute report next to a stream stop: ignored");
                 continue;
             }
             self.state = self.state.map(|m| !m);
@@ -157,10 +186,34 @@ mod tests {
         t0 + Duration::from_millis(ms)
     }
 
+    #[test]
+    fn observations_of_two_streams_combine() {
+        let t0 = Instant::now();
+        let a = AudioObservation {
+            last_audio: Some(ms(t0, 500)),
+            stream_started: None,
+            stream_stopped: Some(ms(t0, 50)),
+        };
+        let b = AudioObservation {
+            last_audio: Some(ms(t0, 200)),
+            stream_started: Some(ms(t0, 100)),
+            stream_stopped: Some(ms(t0, 80)),
+        };
+        let both = AudioObservation {
+            last_audio: Some(ms(t0, 500)),
+            stream_started: Some(ms(t0, 100)),
+            stream_stopped: Some(ms(t0, 80)),
+        };
+        assert_eq!(a.and(b), both);
+        assert_eq!(b.and(a), both);
+        assert_eq!(a.and(AudioObservation::default()), a);
+        assert_eq!(AudioObservation::default().and(b), b);
+    }
+
     fn audio_at(t: Instant) -> AudioObservation {
         AudioObservation {
             last_audio: Some(t),
-            stream_started: None,
+            ..Default::default()
         }
     }
 
@@ -233,11 +286,21 @@ mod tests {
         // gproxd's mic stream starts 50 ms after a report (noticed late).
         m.report(ms(t0, 10_000), &RELEASE);
         m.audio(AudioObservation {
-            last_audio: None,
             stream_started: Some(ms(t0, 10_050)),
+            ..Default::default()
         });
         m.tick(ms(t0, 12_000));
         assert_eq!(m.muted(), Some(false));
+        // The headset mic suspended 89 ms after the report (as seen live),
+        // reported late.
+        m.report(ms(t0, 15_000), &RELEASE);
+        m.tick(ms(t0, 15_500));
+        m.audio(AudioObservation {
+            stream_stopped: Some(ms(t0, 15_089)),
+            ..Default::default()
+        });
+        m.tick(ms(t0, 16_500));
+        assert_eq!(m.muted(), Some(false), "report at a stream stop");
         // A real press afterwards counts.
         m.report(ms(t0, 20_000), &RELEASE);
         m.tick(ms(t0, 21_000));

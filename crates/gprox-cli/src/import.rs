@@ -171,8 +171,17 @@ fn ghub(args: &GhubArgs) -> anyhow::Result<()> {
         bv_dir.display()
     );
     let mut tally = Tally::default();
+    let mut unusable = Vec::new();
     for (p, stem) in s.bluevoice.iter().zip(&bv_stems) {
-        let text = origin(&p.name, &p.id, p.read_only) + &p.to_core().to_toml_string()?;
+        let core = match p.to_core() {
+            Ok(c) => c,
+            Err(e) => {
+                println!("  {:<9} {stem}.toml", "skipped");
+                unusable.push((p, e));
+                continue;
+            }
+        };
+        let text = origin(&p.name, &p.id, p.read_only) + &core.to_toml_string()?;
         let path = bv_dir.join(format!("{stem}.toml"));
         let o = write_preset(&path, &text, args)?;
         tally.add(o);
@@ -185,10 +194,13 @@ fn ghub(args: &GhubArgs) -> anyhow::Result<()> {
 
     print_selections(&s, &eq_stems, &bv_stems);
 
-    if !s.skipped.is_empty() {
+    if !s.skipped.is_empty() || !unusable.is_empty() {
         eprintln!("\nnot imported:");
         for k in &s.skipped {
             eprintln!("  {} {:?} (id {}): {}", k.kind, k.name, k.id, k.reason);
+        }
+        for (p, e) in &unusable {
+            eprintln!("  Blue VO!CE {:?} (id {}): {e}", p.name, p.id);
         }
     }
     Ok(())

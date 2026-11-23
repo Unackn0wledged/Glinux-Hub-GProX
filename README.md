@@ -103,11 +103,14 @@ To bring over your own presets, copy `settings.db` and `settings.db-wal` from `%
 gprox import ghub /path/to/folder-with-settings.db
 ```
 
+A preset with a value outside the range G HUB's own sliders allow is listed under "not imported" with the reason; the rest
+are imported.
+
 ## Usage
 
 - **Tray widget**: right-click the system tray → **Configure System Tray…** → **Entries** → **gprox Headset** → **Always
-  shown**. The popup shows the battery, output and mic volume, the EQ and Blue VO!CE presets, sidetone, auto-off and the mute
-  state. If `~/.config/gprox/headset.png` exists, it is shown as the headset picture.
+  shown**. The popup shows the battery, output and mic volume, the EQ and Blue VO!CE presets, sidetone (with the always-on
+  switch), auto-off and the mute state. If `~/.config/gprox/headset.png` exists, it is shown as the headset picture.
 - **GUI**: `gprox-gui` ("gprox" in the application menu) has the preset pickers, the headphone EQ curve and the headset
   controls.
 - **CLI**:
@@ -137,6 +140,10 @@ gprox sidetone 30
 ```
 
 ```bash
+gprox sidetone always-on on
+```
+
+```bash
 gprox auto-off 15
 ```
 
@@ -149,9 +156,23 @@ basic = [6.0, -3.0]   # bass and treble shelves, dB
 # advanced = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]   # 32 Hz … 16 kHz, ±12 dB
 ```
 
+**Always-on sidetone.** The headset only plays sidetone while the computer records from its mic. With nothing recording,
+PipeWire stops the headset's mic stream after a few seconds and sidetone goes quiet. `gprox sidetone always-on on` (or the
+**Always on** switch in the GUI and the tray widget) keeps the stream open: gproxd records from the headset mic itself
+(`gprox_sidetone` in mixers) and throws the audio away. Apps still only get mic audio when they record from **PRO X Mic
+(gprox)**, and nothing is sent to the headset. Off by default; it is saved and follows dongle re-plugs and headset power
+cycles. While it is on, desktop "microphone in use" indicators (KDE's included) show permanently, and the headset streams its
+mic all the time, which may cost some battery (not measured).
+
 Notes:
 - The mic mute state is best effort: the headset doesn't report it, so gprox counts presses of the mute button and treats any
-  mic audio as live. It shows "unknown" until the mic has been used once.
+  mic audio as live. It shows "unknown" until the mic has been used once (or always-on sidetone is on). The dongle sends the
+  same signal when the headset's mic or playback stream starts or is closed; gproxd watches the headset's devices in
+  PipeWire and ignores it at those moments, so a real press within a second of one is missed until the next press or speech.
+- Only one gproxd runs per user; a second one stops at once. If PipeWire goes away or a stream fails, gproxd exits with an
+  error and the service restarts it.
+- While the headset is missing, **PRO X Mic (gprox)** records silence instead of switching to another microphone, and **PRO X
+  (gprox)** plays to your default output (with the headset EQ still applied).
 - Logs: `journalctl --user -u gproxd`. Turn gprox off for your user: `systemctl --user mask --now gproxd`. When gproxd stops,
   audio falls back to the headset directly.
 
@@ -197,7 +218,8 @@ bash tools/ci.sh
 ```
 
 This runs `cargo fmt`, `clippy` and the tests. The golden tests compare against reference recordings of G HUB's output, which
-are not distributed; without them those tests skip and the rest run normally.
+are not distributed; without them those tests skip and the rest run normally. With the recordings present,
+`GPROX_REQUIRE_VECTORS=1` turns every skip into a failure.
 
 ## License
 

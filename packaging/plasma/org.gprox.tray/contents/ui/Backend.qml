@@ -64,6 +64,7 @@ Item {
     function setBluevoice(name) { gprox(["bluevoice", "set", name], true); }
     function bluevoiceEnable(on) { gprox(["bluevoice", on ? "on" : "off"], true); }
     function setSidetone(level) { gprox(["sidetone", String(Math.round(level))], true); }
+    function setAlwaysOnSidetone(on) { gprox(["sidetone", "always-on", on ? "on" : "off"], true); }
     function setAutoOff(minutes) { gprox(["auto-off", minutes === 0 ? "never" : String(minutes)], true); }
 
     function handle(job, data) {
@@ -127,8 +128,12 @@ Item {
             }
             parts.push(s);
         }
+        const always = !h.always_on_sidetone ? ""
+            : h.mic_kept_open ? " (always on)" : " (always on, mic stream not open yet)";
         if (h.sidetone !== null && h.sidetone !== undefined) {
-            parts.push("sidetone " + h.sidetone);
+            parts.push("sidetone " + h.sidetone + always);
+        } else if (h.always_on_sidetone) {
+            parts.push("sidetone" + always);
         }
         if (h.auto_off_minutes === 0) {
             parts.push("auto-off never");

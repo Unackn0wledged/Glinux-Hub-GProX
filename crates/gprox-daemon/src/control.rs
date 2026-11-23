@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,6 +43,17 @@ pub struct Config {
     pub state_path: PathBuf,
 }
 
+/// The always-on sidetone stream, shared between the controller (control
+/// threads) and gproxd's PipeWire main loop, which creates the stream while
+/// `wanted` is set and reports whether it streams.
+#[derive(Debug, Default)]
+pub struct KeepOpen {
+    /// The setting: keep the headset mic stream open.
+    pub wanted: AtomicBool,
+    /// The keep-alive stream is streaming.
+    pub streaming: AtomicBool,
+}
+
 #[derive(Debug)]
 pub struct Controller {
     cfg: Config,
@@ -54,6 +66,7 @@ pub struct Controller {
     hp: Option<HpEqHandle>,
     bv: Option<BlueVoiceHandle>,
     headset: Option<HeadsetService>,
+    keep_open: Arc<KeepOpen>,
 }
 
 /// Case-insensitive, spaces/dashes/underscores alike.
@@ -116,7 +129,11 @@ impl Controller {
             hp: None,
             bv: None,
             headset: None,
+            keep_open: Arc::default(),
         };
+        c.keep_open
+            .wanted
+            .store(c.state.always_on_sidetone, Ordering::Relaxed);
         if let Some(name) = c.state.hp_eq.clone() {
             match c.load_hp(&name) {
                 Ok((n, p)) => (c.hp_selected, c.hp_preset) = (n, p),
@@ -137,6 +154,12 @@ impl Controller {
             };
             if c.bv_selected.is_none() && c.bv_enabled {
                 c.bv_selected = (!presets.is_empty()).then_some(0);
+            }
+            if let Some(Err(e)) = c.bv_params() {
+                tracing::warn!(error = %format!("{e:#}"),
+                    "saved Blue VO!CE preset not usable; Blue VO!CE off");
+                c.bv_enabled = false;
+                c.bv_selected = None;
             }
         }
         c
@@ -161,6 +184,11 @@ impl Controller {
         self.state
             .sidetone
             .and_then(|l| SidetoneLevel::try_from(l).ok())
+    }
+
+    /// The always-on sidetone flags for the PipeWire main loop.
+    pub fn keep_open(&self) -> Arc<KeepOpen> {
+        self.keep_open.clone()
     }
 
     /// Connect the headset service (HID++).
@@ -236,7 +264,10 @@ impl Controller {
     }
 
     pub fn status(&mut self) -> Status {
-        let headset = self.headset_status();
+        let mut headset = self.headset_status();
+        headset.always_on_sidetone = self.state.always_on_sidetone;
+        headset.mic_kept_open =
+            self.state.always_on_sidetone && self.keep_open.streaming.load(Ordering::Relaxed);
         let presets = self.cfg.bv_presets.as_deref();
         Status {
             headset,
@@ -283,6 +314,14 @@ impl Controller {
             .map_err(|e| anyhow::anyhow!("auto-off: {e}"))?;
         tracing::info!(minutes, "auto-off timer");
         Ok(())
+    }
+
+    /// Always-on sidetone: no HID, only the keep-alive stream (gproxd's main
+    /// loop picks the change up within a second).
+    fn set_always_on_sidetone(&mut self, on: bool) {
+        tracing::info!(on, "always-on sidetone");
+        self.state.always_on_sidetone = on;
+        self.keep_open.wanted.store(on, Ordering::Relaxed);
     }
 
     /// Write the current selections to the state file (errors are logged).
@@ -336,6 +375,9 @@ impl Controller {
                 )
             })?;
         let p = &presets[i];
+        // Check before committing: a refused preset is neither kept nor
+        // persisted.
+        bv_params(Some(p), true).with_context(|| format!("Blue VO!CE preset {:?}", p.name))?;
         tracing::info!(preset = %p.name, enabled = self.bv_enabled, "Blue VO!CE preset");
         self.bv_selected = Some(i);
         self.publish_bv()
@@ -348,12 +390,15 @@ impl Controller {
                  or import presets with `gprox import ghub`"
             );
         };
-        if on && self.bv_selected.is_none() {
+        let mut selected = self.bv_selected;
+        if on && selected.is_none() {
             if presets.is_empty() {
                 bail!("no Blue VO!CE presets");
             }
-            self.bv_selected = Some(0);
+            selected = Some(0);
         }
+        bv_params(selected.map(|i| &presets[i]), on)?;
+        self.bv_selected = selected;
         self.bv_enabled = on;
         tracing::info!(on, "Blue VO!CE");
         self.publish_bv()
@@ -368,6 +413,10 @@ impl Controller {
             Request::BluevoiceEnable { on } => self.bluevoice_enable(*on),
             Request::SetSidetone { level } => self.set_sidetone(*level),
             Request::SetAutoOff { minutes } => self.set_auto_off(*minutes),
+            Request::SetAlwaysOnSidetone { on } => {
+                self.set_always_on_sidetone(*on);
+                Ok(())
+            }
         };
         match r {
             Ok(()) => {
@@ -428,7 +477,11 @@ pub fn serve(ctl: Arc<Mutex<Controller>>, path: &Path) -> anyhow::Result<Server>
                             tracing::warn!(error = %e, "cannot spawn control client thread");
                         }
                     }
-                    Err(e) => tracing::warn!(error = %e, "control socket accept"),
+                    Err(e) => {
+                        // E.g. EMFILE: don't spin on it.
+                        tracing::warn!(error = %e, "control socket accept");
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
                 }
             }
         })
@@ -472,12 +525,21 @@ mod tests {
     use super::*;
     use gprox_core::control::Client;
 
-    // Made-up presets in G HUB's file layout (not G HUB data).
-    const PRESETS: &str = r#"{"presets":[
-      {"id":"a","name":"BLUE_VOICE_PRESET_BROADCASTER_1","blueVoiceSettings":{"settings":{
-        "compressor":{"enabled":true,"threshold":-20}}}},
-      {"id":"b","name":"TSM Myth","blueVoiceSettings":{"settings":{
-        "compressor":{"enabled":false}}}}]}"#;
+    /// A complete made-up preset (the engine defaults, not G HUB data),
+    /// compressor on or off.
+    fn preset(name: &str, comp: bool) -> BlueVoicePreset {
+        let d = BvParams::default();
+        let params = gprox_dsp::bluevoice::params::NAMES.iter().map(|&n| {
+            let id = BvParams::id(n).unwrap();
+            let v = match n {
+                "comp.enable" => f32::from(u8::from(comp)),
+                _ if n.ends_with("enable") => f32::from(u8::from(d.on(id))),
+                _ => d.f(id),
+            };
+            (n, v)
+        });
+        BlueVoicePreset::from_params(name, params).unwrap()
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("gprox-ctl-{tag}-{}", std::process::id()));
@@ -490,13 +552,7 @@ mod tests {
         Config {
             hp_dir: dir.join("hp-eq"),
             hp_extra: None,
-            bv_presets: bv.then(|| {
-                gprox_ghub::bluevoice_presets(PRESETS)
-                    .unwrap()
-                    .iter()
-                    .map(gprox_ghub::BlueVoicePreset::to_core)
-                    .collect()
-            }),
+            bv_presets: bv.then(|| vec![preset("BROADCASTER_1", true), preset("TSM Myth", false)]),
             state_path: dir.join("state.toml"),
         }
     }
@@ -506,6 +562,70 @@ mod tests {
             Response::Ok(s) => s,
             Response::Error(e) => panic!("{e}"),
         }
+    }
+
+    /// A preset the engine refuses (unknown parameter). Presets read
+    /// from files are checked when loaded; this one bypasses that.
+    fn refused_preset() -> BlueVoicePreset {
+        let mut p = preset("Broken", true);
+        p.engine
+            .entry("veq".into())
+            .or_default()
+            .insert("low_q".into(), 1.0);
+        p
+    }
+
+    #[test]
+    fn refused_preset_is_not_kept_or_persisted() {
+        let dir = scratch("refused");
+        let mut cfg = cfg(&dir, true);
+        cfg.bv_presets.as_mut().unwrap().push(refused_preset());
+        let mut c = Controller::new(cfg, State::default());
+        ok(c.handle(&Request::SetBluevoice {
+            name: "tsm myth".into(),
+        }));
+        ok(c.handle(&Request::BluevoiceEnable { on: true }));
+        let r = c.handle(&Request::SetBluevoice {
+            name: "broken".into(),
+        });
+        assert!(matches!(r, Response::Error(_)), "{r:?}");
+        let s = c.status();
+        assert_eq!(s.bluevoice.selected.as_deref(), Some("TSM Myth"));
+        assert!(c.bv_params().unwrap().is_ok());
+        // The next successful request persists the old selection.
+        ok(c.handle(&Request::SetHpEq {
+            name: FLAT_PRESET.into(),
+        }));
+        let state = State::load(&dir.join("state.toml"));
+        assert_eq!(state.bluevoice.as_deref(), Some("TSM Myth"));
+        // Enabling with a refused selection leaves Blue VO!CE as it was.
+        let mut cfg2 = self::cfg(&dir, true);
+        cfg2.bv_presets = Some(vec![refused_preset()]);
+        let mut c2 = Controller::new(cfg2, State::default());
+        assert!(matches!(
+            c2.handle(&Request::BluevoiceEnable { on: true }),
+            Response::Error(_)
+        ));
+        let s = c2.status();
+        assert!(!s.bluevoice.enabled && s.bluevoice.selected.is_none());
+    }
+
+    /// A saved selection the engine refuses starts with Blue VO!CE off
+    /// instead of failing the start (and taking the headphone EQ down).
+    #[test]
+    fn refused_saved_preset_starts_off() {
+        let dir = scratch("refused-start");
+        let mut cfg = cfg(&dir, true);
+        cfg.bv_presets.as_mut().unwrap().push(refused_preset());
+        let state = State {
+            bluevoice: Some("Broken".into()),
+            bluevoice_enabled: true,
+            ..Default::default()
+        };
+        let mut c = Controller::new(cfg, state);
+        let p = c.bv_params().unwrap().unwrap();
+        assert!(!p.on(P::Enable));
+        assert!(!c.status().bluevoice.enabled);
     }
 
     #[test]
@@ -572,6 +692,41 @@ mod tests {
             Response::Error(_)
         ));
         assert_eq!(c3.status().hp_eq.selected, "Bass Boost");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The setting is persisted, restored, reported, and reaches the main
+    /// loop's flag; it needs no headset service (no HID).
+    #[test]
+    fn always_on_sidetone_persists_without_hid() {
+        let dir = scratch("always-on");
+        let mut c = Controller::new(cfg(&dir, false), State::default());
+        let flags = c.keep_open();
+        assert!(!flags.wanted.load(Ordering::Relaxed));
+        let s = c.status();
+        assert!(!s.headset.always_on_sidetone && !s.headset.mic_kept_open);
+
+        let s = ok(c.handle(&Request::SetAlwaysOnSidetone { on: true }));
+        assert!(s.headset.always_on_sidetone);
+        assert!(!s.headset.mic_kept_open, "not streaming yet");
+        assert!(flags.wanted.load(Ordering::Relaxed));
+        flags.streaming.store(true, Ordering::Relaxed);
+        assert!(c.status().headset.mic_kept_open);
+        assert!(State::load(&dir.join("state.toml")).always_on_sidetone);
+
+        // A new controller starts with it on.
+        let mut c2 = Controller::new(cfg(&dir, false), State::load(&dir.join("state.toml")));
+        assert!(c2.keep_open().wanted.load(Ordering::Relaxed));
+        assert!(c2.status().headset.always_on_sidetone);
+
+        let s = ok(c.handle(&Request::SetAlwaysOnSidetone { on: false }));
+        assert!(!s.headset.always_on_sidetone);
+        assert!(
+            !s.headset.mic_kept_open,
+            "a stream still closing is not reported"
+        );
+        assert!(!flags.wanted.load(Ordering::Relaxed));
+        assert!(!State::load(&dir.join("state.toml")).always_on_sidetone);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

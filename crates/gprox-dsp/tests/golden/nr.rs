@@ -34,8 +34,20 @@ const BLOCK: usize = 256;
 /// Pass mark: residual ≤ −40 dB.
 const M3_BAR_DB: f64 = -40.0;
 
+/// Local data missing: skip with a note, or fail when `GPROX_REQUIRE_VECTORS=1`
+/// (set by `tools/ci.sh`), so a run that checked nothing cannot pass.
+fn skip(what: impl std::fmt::Display) {
+    if std::env::var_os("GPROX_REQUIRE_VECTORS").is_some_and(|v| v == "1") {
+        panic!("GPROX_REQUIRE_VECTORS=1, but {what}");
+    }
+    eprintln!("SKIP: {what}");
+}
+
 fn repo_re() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../re")
+    std::env::var_os("GPROX_RE_DIR").map_or_else(
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../re"),
+        PathBuf::from,
+    )
 }
 
 fn session_dir() -> Option<PathBuf> {
@@ -46,10 +58,10 @@ fn session_dir() -> Option<PathBuf> {
     if d.is_dir() {
         Some(d)
     } else {
-        eprintln!(
-            "SKIP: Blue VO!CE reference vectors not found at {} (local only)",
+        skip(format_args!(
+            "Blue VO!CE reference vectors not found at {} (local only)",
             d.display()
-        );
+        ));
         None
     }
 }
@@ -59,7 +71,7 @@ fn case_dir(name: &str) -> Option<PathBuf> {
     if d.is_dir() {
         Some(d)
     } else {
-        eprintln!("SKIP: case {name} missing");
+        skip(format_args!("case {name} missing"));
         None
     }
 }
@@ -356,10 +368,10 @@ fn dll_path() -> PathBuf {
 fn band_table_formula_matches_engine_table() {
     let p = dll_path();
     let Ok(dll) = std::fs::read(&p) else {
-        eprintln!(
-            "SKIP: capture APO DLL not found at {} (local only)",
+        skip(format_args!(
+            "capture APO DLL not found at {} (local only)",
             p.display()
-        );
+        ));
         return;
     };
     let word = |i: usize| {

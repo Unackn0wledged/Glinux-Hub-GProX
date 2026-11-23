@@ -10,6 +10,15 @@ use std::path::{Path, PathBuf};
 use gprox_ghub::bluevoice_presets;
 use serde_json::Value;
 
+/// Local data missing: skip with a note, or fail when `GPROX_REQUIRE_VECTORS=1`
+/// (set by `tools/ci.sh`), so a run that checked nothing cannot pass.
+fn skip(what: impl std::fmt::Display) {
+    if std::env::var_os("GPROX_REQUIRE_VECTORS").is_some_and(|v| v == "1") {
+        panic!("GPROX_REQUIRE_VECTORS=1, but {what}");
+    }
+    eprintln!("SKIP: {what}");
+}
+
 fn re_dir() -> PathBuf {
     std::env::var_os("GPROX_RE_DIR").map_or_else(
         || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../re"),
@@ -50,7 +59,7 @@ fn sent_bits(case: &str) -> Option<Vec<(String, u32)>> {
 #[test]
 fn presets_match_what_ghub_sent() {
     let Ok(text) = std::fs::read_to_string(presets_file()) else {
-        eprintln!("SKIP: G HUB preset file missing (local only)");
+        skip("G HUB preset file missing (local only)");
         return;
     };
     let presets = bluevoice_presets(&text).unwrap();
@@ -61,7 +70,7 @@ fn presets_match_what_ghub_sent() {
         ("am radio", "H8-full-am-b5in"),
     ] {
         let Some(sent) = sent_bits(case) else {
-            eprintln!("SKIP: reference job {case} missing (local only)");
+            skip(format_args!("reference job {case} missing (local only)"));
             return;
         };
         let p = presets.iter().find(|p| p.matches(name)).unwrap();

@@ -15,6 +15,8 @@
 //! ← {"error":"no Blue VO!CE preset \"nope\"; …"}
 //! → {"cmd":"set_sidetone","level":30}
 //! ← {"ok":{…,"headset":{"connected":true,"sidetone":30,…}}}
+//! → {"cmd":"set_always_on_sidetone","on":true}
+//! ← {"ok":{…,"headset":{…,"always_on_sidetone":true,"mic_kept_open":true}}}
 //! ```
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -51,6 +53,10 @@ pub enum Request {
     /// Headset auto-off timer in minutes: 0 (never), 1, 2, 5, 10, 15 or 30
     /// (HID++ write).
     SetAutoOff { minutes: u8 },
+    /// Always-on sidetone: keep the headset's mic stream open even when no
+    /// app records, because the headset only mixes sidetone while it
+    /// streams. No HID++ write; persisted.
+    SetAlwaysOnSidetone { on: bool },
 }
 
 /// The daemon's answer: the status after the request, or an error.
@@ -91,6 +97,11 @@ pub struct HeadsetStatus {
     pub mic_muted: Option<bool>,
     /// Why the dongle can't be used (e.g. permission denied), if so.
     pub error: Option<String>,
+    /// The always-on sidetone setting ([`Request::SetAlwaysOnSidetone`]).
+    pub always_on_sidetone: bool,
+    /// gproxd's keep-alive stream on the headset mic is streaming right now
+    /// (only while `always_on_sidetone` is on and the headset mic exists).
+    pub mic_kept_open: bool,
 }
 
 impl HeadsetStatus {
@@ -123,8 +134,15 @@ impl HeadsetStatus {
             }
             parts.push(s);
         }
-        if let Some(l) = h.sidetone {
-            parts.push(format!("sidetone {l}"));
+        let always = match (h.always_on_sidetone, h.mic_kept_open) {
+            (false, _) => "",
+            (true, true) => " (always on)",
+            (true, false) => " (always on, mic stream not open yet)",
+        };
+        match h.sidetone {
+            Some(l) => parts.push(format!("sidetone {l}{always}")),
+            None if h.always_on_sidetone => parts.push(format!("sidetone{always}")),
+            None => {}
         }
         match h.auto_off_minutes {
             Some(0) => parts.push("auto-off never".into()),
@@ -291,6 +309,10 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"cmd":"set_auto_off","minutes":15}"#).unwrap(),
             Request::SetAutoOff { minutes: 15 }
         );
+        assert_eq!(
+            serde_json::to_string(&Request::SetAlwaysOnSidetone { on: true }).unwrap(),
+            r#"{"cmd":"set_always_on_sidetone","on":true}"#
+        );
         // A status from a daemon without headset support still parses.
         let old = r#"{"ok":{"hp_eq":{"selected":"flat","preset":{},"presets":["flat"]},
             "bluevoice":{"available":false,"enabled":false,"selected":null,"presets":[]}}}"#;
@@ -330,6 +352,8 @@ mod tests {
                 auto_off_minutes: Some(30),
                 mic_muted: None,
                 error: None,
+                always_on_sidetone: true,
+                mic_kept_open: false,
             },
         };
         let line = serde_json::to_string(&Response::Ok(s.clone())).unwrap();
@@ -373,5 +397,16 @@ mod tests {
             h.summary(),
             "on, battery 4100 mV, charging, sidetone 0, auto-off 30 min"
         );
+        h.battery = None;
+        h.auto_off_minutes = None;
+        h.always_on_sidetone = true;
+        assert_eq!(
+            h.summary(),
+            "on, sidetone 0 (always on, mic stream not open yet)"
+        );
+        h.mic_kept_open = true;
+        assert_eq!(h.summary(), "on, sidetone 0 (always on)");
+        h.sidetone = None;
+        assert_eq!(h.summary(), "on, sidetone (always on)");
     }
 }

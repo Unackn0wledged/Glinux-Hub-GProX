@@ -33,12 +33,27 @@ const NCH: usize = 8;
 const FRAMES: usize = 480;
 const FS: u32 = 48_000;
 
+/// Local data missing: skip with a note, or fail when `GPROX_REQUIRE_VECTORS=1`
+/// (set by `tools/ci.sh`), so a run that checked nothing cannot pass.
+fn skip(what: impl std::fmt::Display) {
+    if std::env::var_os("GPROX_REQUIRE_VECTORS").is_some_and(|v| v == "1") {
+        panic!("GPROX_REQUIRE_VECTORS=1, but {what}");
+    }
+    eprintln!("SKIP: {what}");
+}
+
 // ---------------------------------------------------------------- loading
 
 fn vectors_root() -> PathBuf {
-    std::env::var_os("GPROX_EQ_VECTORS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../re/vectors/eq"))
+    if let Some(d) = std::env::var_os("GPROX_EQ_VECTORS") {
+        return PathBuf::from(d);
+    }
+    std::env::var_os("GPROX_RE_DIR")
+        .map_or_else(
+            || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../re"),
+            PathBuf::from,
+        )
+        .join("vectors/eq")
 }
 
 /// The r1 session directory (taps and ramp tests).
@@ -47,10 +62,10 @@ fn session_dir() -> Option<PathBuf> {
     if dir.is_dir() {
         Some(dir)
     } else {
-        eprintln!(
-            "SKIP: EQ vectors not found at {} (gitignored, local only)",
+        skip(format_args!(
+            "EQ vectors not found at {} (gitignored, local only)",
             dir.display()
-        );
+        ));
         None
     }
 }
@@ -60,7 +75,9 @@ fn case_dir(session: &str, name: &str) -> Option<PathBuf> {
     if d.is_dir() {
         Some(d)
     } else {
-        eprintln!("SKIP: case {session}/{name} missing (gitignored, local only)");
+        skip(format_args!(
+            "case {session}/{name} missing (gitignored, local only)"
+        ));
         None
     }
 }
@@ -270,7 +287,7 @@ fn b_ramp_tap_sequences_equal_hooked() {
     for r in ramps() {
         let dir = root.join(r.dir);
         if !dir.is_dir() {
-            eprintln!("SKIP ramp {}: missing", r.dir);
+            skip(format_args!("ramp {} missing", r.dir));
             continue;
         }
         let hooked = read_taps(&dir);

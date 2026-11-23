@@ -40,6 +40,8 @@ clap = { version = "4", features = ["derive"] }
 # System libsqlite3 (pkg-config); 0.40 is the newest with rust-version <= 1.85.
 rusqlite = "0.40"
 tempfile = "3"
+# flock for gproxd's single-instance lock (safe API; already in the tree via tempfile).
+rustix = { version = "1", features = ["fs"] }
 
 [workspace.lints.rust]
 # No unsafe outside the gprox-pw/gprox-hid FFI wrappers. Those crates

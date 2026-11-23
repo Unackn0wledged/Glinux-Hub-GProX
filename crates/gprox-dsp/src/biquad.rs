@@ -36,6 +36,18 @@ impl Taps {
         a2: 0.0,
     };
 
+    /// Finite taps with both poles strictly inside the unit circle
+    /// (`|a2| < 1` and `|a1| < 1 + a2`). A design that fails this (zero
+    /// width, a corner at or above fs/2, negative frequency) would make the
+    /// filter's output grow without bound or turn into NaN.
+    pub fn is_stable(&self) -> bool {
+        [self.b0, self.b1, self.b2, self.a1, self.a2]
+            .iter()
+            .all(|v| v.is_finite())
+            && self.a2.abs() < 1.0
+            && self.a1.abs() < 1.0 + self.a2
+    }
+
     /// The six-tap layout of the hooked tap pushes: `b0, b1, b2, a0 (= 1), a1, a2`.
     pub fn to_six(self) -> [f32; 6] {
         [self.b0, self.b1, self.b2, 1.0, self.a1, self.a2]
