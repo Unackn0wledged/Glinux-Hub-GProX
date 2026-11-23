@@ -48,11 +48,11 @@ An AUR package is coming. Until then, pick one of these.
 [latest release](https://github.com/Unackn0wledged/Glinux-Hub-GProX/releases/latest) and install the downloaded file:
 
 ```bash
-curl -LO https://github.com/Unackn0wledged/Glinux-Hub-GProX/releases/download/v0.1.0/gprox-0.1.0-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/Unackn0wledged/Glinux-Hub-GProX/releases/download/v0.1.1/gprox-0.1.1-1-x86_64.pkg.tar.zst
 ```
 
 ```bash
-sudo pacman -U gprox-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U gprox-0.1.1-1-x86_64.pkg.tar.zst
 ```
 
 The release notes list the package's SHA-256 checksum, so you can check the download with `sha256sum` first.

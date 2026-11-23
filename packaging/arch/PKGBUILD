@@ -7,7 +7,7 @@
 # G HUB install after installing.
 
 pkgname=gprox
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Headphone EQ, Blue VO!CE mic chain and headset controls for the Logitech PRO X Wireless (G HUB replacement)'
 arch=('x86_64')
