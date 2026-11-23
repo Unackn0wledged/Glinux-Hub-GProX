@@ -4,7 +4,7 @@
 # `gprox setup` copies it from the user's own G HUB install after installing.
 
 pkgname=gprox
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Headphone EQ, Blue VO!CE mic chain and headset controls for the Logitech PRO X Wireless (G HUB replacement)'
 arch=('x86_64')
@@ -33,7 +33,7 @@ optdepends=(
 install=gprox.install
 _src=Glinux-Hub-GProX-$pkgver
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('43da1844badeaa87a704a8164dfde9d0392163a7c527a084a5defc071a9010f9')
+sha256sums=('17e7cddfbee24ab8e7759ecfda727e76f9f4719f50a0c2805b35e71a23adbcfc')
 
 prepare() {
   cd "$_src"
