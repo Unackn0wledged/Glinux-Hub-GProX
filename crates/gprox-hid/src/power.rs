@@ -317,7 +317,10 @@ pub(crate) mod tests {
             .join("ghub/collect-20261120-233900/files/ProgramData_LGHUB/depots/891982/pro_headset")
             .join(GHUB_FILE);
         let Ok(m) = PowerModel::load(&p) else {
-            eprintln!("skipped: {} not found", p.display());
+            if std::env::var_os("GPROX_REQUIRE_VECTORS").is_some_and(|v| v == "1") {
+                panic!("GPROX_REQUIRE_VECTORS=1, but {} not found", p.display());
+            }
+            eprintln!("SKIP: {} not found", p.display());
             return;
         };
         let c = m.discharging(3804);

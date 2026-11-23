@@ -22,6 +22,15 @@ use gprox_dsp::{EqMode, HpEqSettings, RampBlock};
 use gprox_ghub::settings::{self, GhubSettings, PRO_X_WIRELESS};
 use serde_json::Value;
 
+/// Local data missing: skip with a note, or fail when `GPROX_REQUIRE_VECTORS=1`
+/// (set by `tools/ci.sh`), so a run that checked nothing cannot pass.
+fn skip(what: impl std::fmt::Display) {
+    if std::env::var_os("GPROX_REQUIRE_VECTORS").is_some_and(|v| v == "1") {
+        panic!("GPROX_REQUIRE_VECTORS=1, but {what}");
+    }
+    eprintln!("SKIP: {what}");
+}
+
 fn re_dir() -> PathBuf {
     std::env::var_os("GPROX_RE_DIR").map_or_else(
         || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../re"),
@@ -37,7 +46,7 @@ fn snapshots_dir() -> PathBuf {
 fn load(tag: &str) -> Option<GhubSettings> {
     let db = snapshots_dir().join(tag).join("settings.db");
     if !db.is_file() {
-        eprintln!("SKIP: {} missing (local only)", db.display());
+        skip(format_args!("{} missing (local only)", db.display()));
         return None;
     }
     let doc = settings::read_settings_db(&db).unwrap();
@@ -60,7 +69,7 @@ fn eq_via_toml(p: &HeadphoneEqPreset) -> HeadphoneEqPreset {
 }
 
 fn bv_via_toml(p: &gprox_ghub::BlueVoicePreset) -> CorePreset {
-    CorePreset::from_toml_str(&p.to_core().to_toml_string().unwrap()).unwrap()
+    CorePreset::from_toml_str(&p.to_core().unwrap().to_toml_string().unwrap()).unwrap()
 }
 
 /// Every EQ and Blue VO!CE card in every snapshot imports, and survives the
@@ -97,7 +106,7 @@ fn every_preset_imports() {
         );
     }
     if seen == 0 {
-        eprintln!("SKIP: no settings.db snapshots");
+        skip("no settings.db snapshots");
     }
 }
 
@@ -164,7 +173,7 @@ fn bluevoice_matches_what_ghub_sent() {
     ] {
         let Some(s) = load(tag) else { continue };
         let Some(sent) = sent_bits(case) else {
-            eprintln!("SKIP: reference job {case} missing (local only)");
+            skip(format_args!("reference job {case} missing (local only)"));
             continue;
         };
         let p = s.bluevoice.iter().find(|p| p.id.starts_with(id)).unwrap();
@@ -263,7 +272,7 @@ fn eq_presets_give_hooked_taps() {
     for (tag, id, case, seq) in cases {
         let Some(s) = load(tag) else { continue };
         let Some(hooked) = hooked_taps(&vectors.join(case)) else {
-            eprintln!("SKIP: EQ vectors {case} missing (local only)");
+            skip(format_args!("EQ vectors {case} missing (local only)"));
             continue;
         };
         let card = s.eq.iter().find(|p| p.id.starts_with(id)).unwrap();

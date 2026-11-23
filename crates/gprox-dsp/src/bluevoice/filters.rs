@@ -30,8 +30,13 @@ impl DePopper {
         self.freq.target = p.f(P::DpopFreq);
     }
 
+    /// Redesign for the smoothed frequency. A design that isn't a stable
+    /// filter (corner ≤ 0 or ≥ fs/2) keeps the previous taps.
     pub fn design(&mut self, fs: u32) {
-        self.taps = highpass_butter2(self.freq.cur, fs);
+        let t = highpass_butter2(self.freq.cur, fs);
+        if t.is_stable() {
+            self.taps = t;
+        }
     }
 
     pub fn reset(&mut self) {

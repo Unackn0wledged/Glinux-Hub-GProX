@@ -25,6 +25,7 @@
 //! The `pipewire` crate has no `pw_filter` binding; this
 //! design needs only the safe stream API, so this crate contains no `unsafe`.
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -33,9 +34,12 @@ use pipewire as pw;
 use pw::core::CoreRc;
 use pw::properties::PropertiesBox;
 use pw::spa;
-use pw::stream::{StreamFlags, StreamRc};
+use pw::stream::{StreamFlags, StreamRc, StreamState};
 use spa::param::audio::{AudioFormat, AudioInfoRaw};
 use spa::pod::Pod;
+
+pub mod watch;
+pub use watch::{DeviceState, NodeWatch, StreamEdge};
 
 /// Largest block we size scratch buffers for (PipeWire's default
 /// `default.clock.quantum-limit`).
@@ -185,11 +189,14 @@ impl std::fmt::Debug for Duplex {
 }
 
 impl Duplex {
-    /// Create both streams and connect them. Must be called on the main-loop thread.
+    /// Create both streams and connect them. Must be called on the main-loop
+    /// thread. `on_fatal` is called when either stream errors or is
+    /// disconnected ([`fatal_transition`]).
     pub fn new<P: Processor>(
         core: &CoreRc,
         spec: DuplexSpec,
         mut processor: P,
+        on_fatal: OnFatal,
     ) -> Result<Self, Error> {
         let channels = spec.positions.len();
         if channels == 0 || channels > MAX_CHANNELS {
@@ -218,9 +225,12 @@ impl Duplex {
             other: capture.clone(),
             core: core_state,
         };
+        let mut play_state = on_state(format!("{}.playback", spec.name), on_fatal.clone());
+        let mut cap_state = on_state(format!("{}.capture", spec.name), on_fatal);
         let playback_listener = playback
             .add_local_listener_with_user_data(state)
             .process(|stream, st| run_cycle(&st.other, stream, &mut st.core))
+            .state_changed(move |stream, _, old, new| play_state(stream, old, new))
             .register()?;
         let trigger_stats = stats.clone();
         let capture_listener = capture
@@ -233,6 +243,7 @@ impl Duplex {
                     while stream.dequeue_buffer().is_some() {}
                 }
             })
+            .state_changed(move |stream, _, old, new| cap_state(stream, old, new))
             .register()?;
 
         let format = format_pod(spec.rate, &spec.positions)?;
@@ -281,6 +292,37 @@ impl Duplex {
     /// PipeWire node ids of (capture, playback) streams; `u32::MAX` until connected.
     pub fn node_ids(&self) -> (u32, u32) {
         (self.capture.node_id(), self.playback.node_id())
+    }
+}
+
+/// Called (on the main-loop thread) when a path can no longer carry audio;
+/// the argument says why.
+pub type OnFatal = Rc<dyn Fn(String)>;
+
+/// Whether a stream state change means the path is dead: the error state,
+/// or a drop back to unconnected (node destroyed, connection lost). Returns
+/// the reason.
+pub fn fatal_transition(old: &StreamState, new: &StreamState) -> Option<String> {
+    match (old, new) {
+        (_, StreamState::Error(e)) => Some(format!("stream error: {e}")),
+        (StreamState::Unconnected, StreamState::Unconnected) => None,
+        (_, StreamState::Unconnected) => Some("stream disconnected".into()),
+        _ => None,
+    }
+}
+
+/// The `state_changed` handler of one stream: log the change, report a fatal
+/// one. Runs on the main-loop thread (only `process` runs on the data thread).
+fn on_state(
+    name: String,
+    on_fatal: OnFatal,
+) -> impl FnMut(&pw::stream::Stream, StreamState, StreamState) + 'static {
+    move |_, old, new| {
+        // Paused ↔ Streaming happens whenever an app starts or stops.
+        tracing::debug!(stream = %name, ?old, ?new, "stream state");
+        if let Some(why) = fatal_transition(&old, &new) {
+            on_fatal(format!("{name}: {why}"));
+        }
     }
 }
 
@@ -440,6 +482,10 @@ fn stream_properties(spec: &DuplexSpec) -> (PropertiesBox, PropertiesBox) {
             play.insert(*pw::keys::MEDIA_CATEGORY, "Playback");
             play.insert("stream.dont-remix", "true");
             if let Some(t) = &spec.target {
+                // No dont-fallback here (unlike the mic): without the headset,
+                // WirePlumber plays to the default output, EQ included.
+                // A choice for now; the alternative is to remove the sink
+                // while the headset is gone.
                 play.insert(*pw::keys::TARGET_OBJECT, t.as_str());
             }
         }
@@ -456,6 +502,13 @@ fn stream_properties(spec: &DuplexSpec) -> (PropertiesBox, PropertiesBox) {
             cap.insert("stream.dont-remix", "true");
             if let Some(t) = &spec.target {
                 cap.insert(*pw::keys::TARGET_OBJECT, t.as_str());
+                // Without the headset, record nothing: WirePlumber would
+                // otherwise link the default (e.g. a webcam) mic, and apps
+                // recording from "PRO X Mic (gprox)" would get it.
+                // `node.linger` makes WirePlumber wait for the target instead
+                // of destroying the node.
+                cap.insert("node.dont-fallback", "true");
+                cap.insert("node.linger", "true");
             }
             // Virtual source apps record from.
             play.insert(*pw::keys::NODE_NAME, spec.name.as_str());
@@ -468,6 +521,145 @@ fn stream_properties(spec: &DuplexSpec) -> (PropertiesBox, PropertiesBox) {
         }
     }
     (cap, play)
+}
+
+/// Static description of a [`KeepAlive`] stream.
+#[derive(Debug, Clone)]
+pub struct KeepAliveSpec {
+    /// `node.name` of the stream.
+    pub name: String,
+    /// `node.description` / `media.name` (what mixers show).
+    pub description: String,
+    /// `node.name` of the source to keep running.
+    pub target: String,
+    /// Rate of the (mono, f32) data handed to the observer.
+    pub rate: u32,
+    /// Requested quantum in frames.
+    pub latency_frames: u32,
+}
+
+/// A recording stream that only keeps a source running: it is linked to
+/// `target` with a non-passive link, so the session manager never suspends
+/// the source, and it throws the data away after showing each block to an
+/// observer. It has no output ports, so nothing can record from it.
+///
+/// Used to keep the headset's USB capture interface streaming, which the
+/// headset needs for sidetone.
+pub struct KeepAlive {
+    _listener: Box<dyn std::any::Any>,
+    stream: StreamRc,
+    cycles: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for KeepAlive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeepAlive")
+            .field("node", &self.stream.node_id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl KeepAlive {
+    /// Create and connect the stream. Must be called on the main-loop thread.
+    ///
+    /// `observe` runs on the data thread for every block (mono f32 samples):
+    /// it must follow the RT rules (no allocation, locks, syscalls or
+    /// logging). `on_state` runs on the main-loop thread for every stream
+    /// state change, with the old and new state.
+    pub fn new<F, S>(
+        core: &CoreRc,
+        spec: &KeepAliveSpec,
+        observe: F,
+        on_state: S,
+    ) -> Result<Self, Error>
+    where
+        F: FnMut(&[f32]) + 'static,
+        S: FnMut(&StreamState, &StreamState) + 'static,
+    {
+        if spec.latency_frames == 0 || spec.latency_frames as usize > MAX_FRAMES {
+            return Err(Error::Spec("latency_frames must be 1..=MAX_FRAMES"));
+        }
+        let stream = StreamRc::new(core.clone(), &spec.description, keep_alive_properties(spec))?;
+        let cycles = Arc::new(AtomicU64::new(0));
+        let mut on_state = on_state;
+        let listener = stream
+            .add_local_listener_with_user_data((observe, cycles.clone()))
+            .process(|stream, (observe, cycles)| keep_alive_cycle(stream, observe, cycles))
+            .state_changed(move |_, _, old, new| on_state(&old, &new))
+            .register()?;
+        let format = format_pod(spec.rate, &[position::MONO])?;
+        let mut params = [Pod::from_bytes(&format).ok_or(Error::Pod)?];
+        stream.connect(
+            spa::utils::Direction::Input,
+            None,
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+            &mut params,
+        )?;
+        Ok(Self {
+            _listener: Box::new(listener),
+            stream,
+            cycles,
+        })
+    }
+
+    /// Process callbacks so far.
+    pub fn cycles(&self) -> u64 {
+        self.cycles.load(Ordering::Relaxed)
+    }
+
+    /// PipeWire node id; `u32::MAX` until connected.
+    pub fn node_id(&self) -> u32 {
+        self.stream.node_id()
+    }
+}
+
+/// Data-thread callback of a [`KeepAlive`]. RT rules: no allocation, locks,
+/// syscalls or logging. Every queued buffer is shown to `observe` and handed
+/// back (dropping it re-queues it).
+fn keep_alive_cycle<F: FnMut(&[f32])>(
+    stream: &pw::stream::Stream,
+    observe: &mut F,
+    cycles: &AtomicU64,
+) {
+    bump(cycles);
+    while let Some(mut buf) = stream.dequeue_buffer() {
+        if let Some(d) = buf.datas_mut().first_mut() {
+            let (off, size) = (d.chunk().offset() as usize, d.chunk().size() as usize);
+            if let Some(samples) = d.data().and_then(|bytes| {
+                let end = off.saturating_add(size).min(bytes.len());
+                bytemuck::try_cast_slice::<u8, f32>(&bytes[off.min(end)..end]).ok()
+            }) {
+                observe(samples);
+            }
+        }
+    }
+}
+
+/// Properties of a [`KeepAlive`] stream.
+fn keep_alive_properties(spec: &KeepAliveSpec) -> PropertiesBox {
+    let mut p = PropertiesBox::new();
+    p.insert(*pw::keys::MEDIA_TYPE, "Audio");
+    p.insert(*pw::keys::MEDIA_CATEGORY, "Capture");
+    p.insert(*pw::keys::MEDIA_CLASS, "Stream/Input/Audio");
+    p.insert(*pw::keys::MEDIA_NAME, spec.description.as_str());
+    p.insert(*pw::keys::NODE_NAME, spec.name.as_str());
+    p.insert(*pw::keys::NODE_DESCRIPTION, spec.description.as_str());
+    // A non-passive link keeps the source running, so the session manager
+    // never sees it idle and never suspends it.
+    p.insert(*pw::keys::NODE_PASSIVE, "false");
+    p.insert(*pw::keys::TARGET_OBJECT, spec.target.as_str());
+    // Without the target: link nothing else and wait for it (as on the mic
+    // path); a desktop mixer can't move it to another source.
+    p.insert("node.dont-fallback", "true");
+    p.insert("node.linger", "true");
+    p.insert("node.dont-move", "true");
+    p.insert(
+        *pw::keys::NODE_LATENCY,
+        format!("{}/{}", spec.latency_frames, spec.rate),
+    );
+    p.insert("audio.position", position_name(position::MONO));
+    p.insert("stream.dont-remix", "true");
+    p
 }
 
 fn position_name(p: u32) -> &'static str {
@@ -537,6 +729,61 @@ mod tests {
         assert_eq!(cap.get("node.passive"), Some("true"));
         assert_eq!(play.get("priority.session"), Some("3000"));
         assert_eq!(cap.get("priority.session"), None);
+        // Headset mic missing: record nothing rather than another
+        // microphone; linger keeps WirePlumber from destroying the node
+        // while it waits for the headset.
+        assert_eq!(cap.get("node.dont-fallback"), Some("true"));
+        assert_eq!(cap.get("node.linger"), Some("true"));
+    }
+
+    /// The keep-alive stream must hold the source open (non-passive), stay on
+    /// the headset (no fallback, no move, wait while it is gone) and be an
+    /// input stream only.
+    #[test]
+    fn keep_alive_properties_hold_the_source() {
+        let p = keep_alive_properties(&KeepAliveSpec {
+            name: "gprox_sidetone".into(),
+            description: "Sidetone".into(),
+            target: "alsa_x".into(),
+            rate: 48_000,
+            latency_frames: 1024,
+        });
+        assert_eq!(p.get("node.passive"), Some("false"));
+        assert_eq!(p.get("media.class"), Some("Stream/Input/Audio"));
+        assert_eq!(p.get("target.object"), Some("alsa_x"));
+        assert_eq!(p.get("node.dont-fallback"), Some("true"));
+        assert_eq!(p.get("node.linger"), Some("true"));
+        assert_eq!(p.get("node.dont-move"), Some("true"));
+        assert_eq!(p.get("node.name"), Some("gprox_sidetone"));
+        assert_eq!(p.get("node.latency"), Some("1024/48000"));
+        assert_eq!(p.get("audio.position"), Some("MONO"));
+        // Not part of any gprox link group: WirePlumber links it on its own.
+        assert_eq!(p.get("node.link-group"), None);
+        assert_eq!(p.get("node.group"), None);
+        // The main mic input stays passive: only the keep-alive holds the
+        // headset open.
+        let (cap, _) = stream_properties(&spec(Direction::Capture));
+        assert_eq!(cap.get("node.passive"), Some("true"));
+    }
+
+    /// A stream in the error state, or one that drops back to unconnected,
+    /// no longer carries audio: gproxd must exit (and be restarted) instead
+    /// of answering on its control socket as if all were well.
+    #[test]
+    fn fatal_stream_states() {
+        use pw::stream::StreamState as S;
+        let fatal = |old, new| fatal_transition(&old, &new).is_some();
+        assert!(fatal(S::Streaming, S::Error("node destroyed".into())));
+        assert!(fatal(S::Connecting, S::Error("no format".into())));
+        assert!(fatal(S::Paused, S::Unconnected));
+        assert!(fatal(S::Streaming, S::Unconnected));
+        assert!(!fatal(S::Unconnected, S::Connecting));
+        assert!(!fatal(S::Connecting, S::Paused));
+        assert!(!fatal(S::Paused, S::Streaming));
+        assert!(!fatal(S::Streaming, S::Paused));
+        assert!(!fatal(S::Unconnected, S::Unconnected));
+        let why = fatal_transition(&S::Streaming, &S::Error("node destroyed".into())).unwrap();
+        assert!(why.contains("node destroyed"), "{why}");
     }
 
     #[test]

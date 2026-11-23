@@ -14,7 +14,10 @@
 //! Bar: residual ≤ −50 dB relative to the reference output,
 //! static gain-reduction curves within 0.2 dB on the staircase signals.
 //! Cases with the NR on (H7 in the chain, H8 full chain, H9 stereo) use the
-//! −40 dB bar.
+//! −40 dB bar. Each case is held tighter than that: bit-exact where it is
+//! today, else about 8 dB above its measured residual; a dynamics case must
+//! also move its block's gain by 3 dB, and
+//! `cases_notice_wrong_dynamics_parameters` checks that wrong settings fail.
 //! Run with `-- --nocapture` for the numbers; set `GPROX_BV_DUMP=<dir>` to
 //! write our output per case as `<case>.ours.f32` (planar) for inspection.
 
@@ -150,12 +153,25 @@ fn parse_json(s: &str) -> J {
 
 // ---------------------------------------------------------------- loading
 
+/// Local data missing: skip with a note, or fail when `GPROX_REQUIRE_VECTORS=1`
+/// (set by `tools/ci.sh`), so a run that checked nothing cannot pass.
+fn skip(what: impl std::fmt::Display) {
+    if std::env::var_os("GPROX_REQUIRE_VECTORS").is_some_and(|v| v == "1") {
+        panic!("GPROX_REQUIRE_VECTORS=1, but {what}");
+    }
+    eprintln!("SKIP: {what}");
+}
+
 fn session_dir() -> PathBuf {
     std::env::var_os("GPROX_BV_VECTORS")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../re/vectors/bluevoice-harness/re5h-20261121-r1")
+            std::env::var_os("GPROX_RE_DIR")
+                .map_or_else(
+                    || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../re"),
+                    PathBuf::from,
+                )
+                .join("vectors/bluevoice-harness/re5h-20261121-r1")
         })
 }
 
@@ -183,12 +199,24 @@ struct Case {
     input: Vec<Vec<f32>>,
     reference: Vec<Vec<f32>>,
     ours: Vec<Vec<f32>>,
+    /// Lowest gain each dynamics block reached during the run, in dB, indexed
+    /// by [`Dyn`].
+    min_gain_db: [f64; 4],
 }
 
 fn load_and_run(name: &str) -> Option<Case> {
+    load_and_run_with(name, &|_| {})
+}
+
+/// Like [`load_and_run`] with `mutate` applied to the case's parameters (for
+/// the sensitivity checks).
+fn load_and_run_with(name: &str, mutate: &dyn Fn(&mut BvParams)) -> Option<Case> {
     let dir = session_dir().join(name);
     if !dir.is_dir() {
-        eprintln!("SKIP: {} missing (gitignored, local only)", dir.display());
+        skip(format_args!(
+            "{} missing (gitignored, local only)",
+            dir.display()
+        ));
         return None;
     }
     let job = parse_json(&std::fs::read_to_string(dir.join("job.json")).unwrap());
@@ -212,6 +240,7 @@ fn load_and_run(name: &str) -> Option<Case> {
 
     let mut p = BvParams::default();
     apply_sets(&mut p, job.get("sets").unwrap());
+    mutate(&mut p);
     let mut events: Vec<(usize, &J)> = job
         .get("events")
         .map(|e| {
@@ -243,6 +272,7 @@ fn load_and_run(name: &str) -> Option<Case> {
         })
         .collect();
     let mut out = vec![vec![0.0f32; len]; 2];
+    let mut min_gain = [1.0f32; 4];
     let mut pos = 0;
     let mut ev = events.into_iter().peekable();
     // Host quantum deliberately not a divisor of the block: 480 frames.
@@ -256,12 +286,16 @@ fn load_and_run(name: &str) -> Option<Case> {
                 let (_, sets) = ev.next().unwrap();
                 let mut q = *bv.params();
                 apply_sets(&mut q, sets);
+                mutate(&mut q);
                 bv.apply(&q);
             }
         }
         let ins: Vec<&[f32]> = padded.iter().map(|x| &x[pos..end]).collect();
         let [l, r] = &mut out[..] else { unreachable!() };
         bv.process(&ins, &mut [&mut l[pos..end], &mut r[pos..end]]);
+        for (m, g) in min_gain.iter_mut().zip(bv.gains()) {
+            *m = m.min(g);
+        }
         pos = end;
     }
     let ours = (0..ch.max(2)).map(|c| out[c][delay..].to_vec()).collect();
@@ -271,6 +305,7 @@ fn load_and_run(name: &str) -> Option<Case> {
         input,
         reference,
         ours,
+        min_gain_db: min_gain.map(|g| db(f64::from(g))),
     })
 }
 
@@ -361,65 +396,111 @@ fn curve_error(c: &Case, step_s: f64, delay: usize, floor_db: f64) -> (f64, f64)
 
 // ---------------------------------------------------------------- cases
 
+/// The dynamics blocks, in the order of `BlueVoice::gains`.
+#[derive(Debug, Clone, Copy)]
+enum Dyn {
+    Exp = 0,
+    Des = 1,
+    Comp = 2,
+    Lim = 3,
+}
+
+/// How much a case's own dynamics block must move its gain for the case to
+/// say anything about that block (a compressor below its
+/// threshold is a pure delay and matches whatever its settings are).
+const ENGAGE_DB: f64 = -3.0;
+
 struct Expect {
-    /// Maximum residual in dB (−50 dB bar).
+    /// Maximum residual in dB. The bars are −50 dB (without NR) and −40 dB
+    /// (with NR); each case's bar is tightened to 5–10 dB above what it
+    /// measures today, so a regression that is still under the bar is caught.
     residual_db: f64,
-    /// Require bit-exact output.
+    /// Require bit-exact output (where it holds today).
     exact: bool,
     /// Staircase step length in s, if the case is a static-curve case.
     stair_s: Option<f64>,
+    /// The dynamics block this case is about: its gain must reach
+    /// [`ENGAGE_DB`].
+    engages: Option<Dyn>,
 }
 
 const BAR: Expect = Expect {
     residual_db: -50.0,
     exact: false,
     stair_s: None,
+    engages: None,
 };
+
+/// Bit-exact today: asserted.
+const EXACT: Expect = Expect { exact: true, ..BAR };
+
+/// Not bit-exact; `db` is the tightened residual bar.
+const fn below(db: f64) -> Expect {
+    Expect {
+        residual_db: db,
+        ..BAR
+    }
+}
+
+/// What failed, if anything.
+fn verdict(c: &Case, e: &Expect) -> (String, Vec<String>) {
+    let name = &c.name;
+    let m = measure(c);
+    let mut line = format!(
+        "{name:28} residual {:7.1} dB  max|err| {:.2e}  exact {}/{}",
+        m.residual_db, m.max_err, m.exact, m.total
+    );
+    let mut fails = Vec::new();
+    if let Some(step) = e.stair_s {
+        // Gain-reduction curve over steps above −80 dBFS input. Levels are
+        // measured on the second half of each step, compensating the chain's
+        // look-ahead (256 frames for exp/comp, 128 for the limiter).
+        let (d, at) = curve_error(c, step, 256, -80.0);
+        line += &format!("  static curve max Δ {d:+.3} dB @ {at:.0} dBFS");
+        if d.abs() > 0.2 {
+            fails.push(format!("static curve off by {d:.3} dB at {at:.0} dBFS"));
+        }
+    }
+    if let Some(d) = e.engages {
+        let g = c.min_gain_db[d as usize];
+        line += &format!("  {d:?} gain down to {g:.1} dB");
+        if g > ENGAGE_DB {
+            fails.push(format!(
+                "{d:?} gain only reaches {g:.1} dB: the case doesn't exercise it"
+            ));
+        }
+    }
+    if e.exact && m.exact != m.total {
+        fails.push(format!("not bit-exact ({}/{})", m.exact, m.total));
+    }
+    if m.residual_db > e.residual_db {
+        fails.push(format!(
+            "residual {:.1} dB > {} dB",
+            m.residual_db, e.residual_db
+        ));
+    }
+    (line, fails)
+}
 
 fn golden(name: &str, e: Expect) {
     let Some(c) = load_and_run(name) else {
         return;
     };
-    let m = measure(&c);
-    let mut line = format!(
-        "{name:28} residual {:7.1} dB  max|err| {:.2e}  exact {}/{}",
-        m.residual_db, m.max_err, m.exact, m.total
-    );
-    let mut curve = None;
-    if let Some(step) = e.stair_s {
-        // Gain-reduction curve over steps above −80 dBFS input. Levels are
-        // measured on the second half of each step, compensating the chain's
-        // look-ahead (256 frames for exp/comp, 128 for the limiter).
-        let ce = curve_error(&c, step, 256, -80.0);
-        line += &format!("  static curve max Δ {:+.3} dB @ {:.0} dBFS", ce.0, ce.1);
-        curve = Some(ce);
-    }
+    let (line, fails) = verdict(&c, &e);
     eprintln!("{line}");
-    if e.exact {
-        assert_eq!(m.exact, m.total, "{name}: not bit-exact");
-    }
-    assert!(
-        m.residual_db <= e.residual_db,
-        "{name}: residual {:.1} dB > {} dB",
-        m.residual_db,
-        e.residual_db
-    );
-    if let Some((d, at)) = curve {
-        assert!(
-            d.abs() <= 0.2,
-            "{name}: static curve off by {d:.3} dB at {at:.0} dBFS"
-        );
-    }
+    assert!(fails.is_empty(), "{name}: {}", fails.join("; "));
 }
 
 #[test]
 fn h0_off_noise_is_a_pure_delay() {
-    golden("H0-off-noise", Expect { exact: true, ..BAR });
+    golden("H0-off-noise", EXACT);
 }
 
+/// Reference and output are all digital silence: only checks that "off"
+/// adds nothing.
 #[test]
 fn h0_off_silence() {
-    golden("H0-off-silence", Expect { exact: true, ..BAR });
+    golden("H0-off-silence", EXACT);
 }
 
 #[test]
@@ -433,133 +514,216 @@ fn h1_voice_eq() {
         "H1-veq-am-noise",
         "H1-veq-bc1-smooth50-step",
     ] {
-        golden(c, BAR);
+        golden(c, EXACT);
     }
 }
 
 #[test]
 fn h2_de_popper() {
-    for c in [
-        "H2-dpop-85-thumps",
-        "H2-dpop-85-sweep",
-        "H2-dpop-150-sweep",
-        "H2-dpop-smooth50-step",
-    ] {
-        golden(c, BAR);
+    // Measured −102.0, −112.8, −117.1, −112.4 dB.
+    golden("H2-dpop-85-thumps", below(-95.0));
+    golden("H2-dpop-85-sweep", below(-105.0));
+    golden("H2-dpop-150-sweep", below(-110.0));
+    golden("H2-dpop-smooth50-step", below(-105.0));
+}
+
+const fn stair(step_s: f64, d: Dyn) -> Expect {
+    Expect {
+        stair_s: Some(step_s),
+        engages: Some(d),
+        ..EXACT
+    }
+}
+
+const fn engages(d: Dyn, e: Expect) -> Expect {
+    Expect {
+        engages: Some(d),
+        ..e
     }
 }
 
 #[test]
 fn h3_expander() {
-    golden(
-        "H3-exp-bc1-stair",
-        Expect {
-            stair_s: Some(0.4),
-            ..BAR
-        },
-    );
-    golden(
-        "H3-exp-r2-t50-stair",
-        Expect {
-            stair_s: Some(0.4),
-            ..BAR
-        },
-    );
-    golden("H3-exp-bc1-bursts", BAR);
-    golden("H3-exp-auto-bursts", BAR);
+    golden("H3-exp-bc1-stair", stair(0.4, Dyn::Exp));
+    golden("H3-exp-r2-t50-stair", stair(0.4, Dyn::Exp));
+    golden("H3-exp-bc1-bursts", engages(Dyn::Exp, EXACT));
+    // The expander gates here, but the auto-threshold makes no difference to
+    // this case's output (switching it off is still bit-exact): it has no
+    // golden coverage until a new case is recorded.
+    golden("H3-exp-auto-bursts", engages(Dyn::Exp, EXACT));
 }
 
 #[test]
 fn h4_compressor() {
-    golden(
-        "H4-comp-bc1-stair",
-        Expect {
-            stair_s: Some(0.4),
-            ..BAR
-        },
-    );
-    golden(
-        "H4-comp-r10-t20-stair",
-        Expect {
-            stair_s: Some(0.4),
-            ..BAR
-        },
-    );
-    golden("H4-comp-bc1-bursts", BAR);
-    golden("H4-comp-a10-r50-bursts", BAR);
+    golden("H4-comp-bc1-stair", stair(0.4, Dyn::Comp));
+    golden("H4-comp-r10-t20-stair", stair(0.4, Dyn::Comp));
+    // The bursts peak at −10 dBFS, below Broadcaster 1's −7 dB threshold:
+    // the compressor is a pure delay here, so this case only checks that
+    // (no `engages`). Compressor time constants are covered by a10-r50.
+    golden("H4-comp-bc1-bursts", EXACT);
+    golden("H4-comp-a10-r50-bursts", engages(Dyn::Comp, EXACT));
 }
 
 #[test]
 fn h5_de_esser() {
-    golden("H5-des-bc1-sibilant", BAR);
-    golden("H5-des-5k-t15-sibilant", BAR);
+    golden("H5-des-bc1-sibilant", engages(Dyn::Des, EXACT));
+    // Measured −191.0 dB.
+    golden("H5-des-5k-t15-sibilant", engages(Dyn::Des, below(-183.0)));
 }
 
 #[test]
 fn h6_limiter() {
-    golden(
-        "H6-lim-boost1-stairhot",
-        Expect {
-            stair_s: Some(0.3),
-            ..BAR
-        },
-    );
-    golden(
-        "H6-lim-bc1-stairhot",
-        Expect {
-            stair_s: Some(0.3),
-            ..BAR
-        },
-    );
-    golden("H6-lim-boost1-burstshot", BAR);
-    golden("H6-lim-a1-r50-burstshot", BAR);
+    golden("H6-lim-boost1-stairhot", stair(0.3, Dyn::Lim));
+    golden("H6-lim-bc1-stairhot", stair(0.3, Dyn::Lim));
+    // Measured −154.1 dB.
+    golden("H6-lim-boost1-burstshot", engages(Dyn::Lim, below(-146.0)));
+    golden("H6-lim-a1-r50-burstshot", engages(Dyn::Lim, EXACT));
 }
 
-/// Cases with the NR on use a −40 dB bar.
-const NR_BAR: Expect = Expect {
-    residual_db: -40.0,
-    exact: false,
-    stair_s: None,
-};
+// Cases with the NR on: the bar is −40 dB; each is tightened to about 8 dB
+// above its measured residual. About half of the samples in some reference
+// cases are digital silence, so their printed "exact" counts say little.
 
 #[test]
 fn h7_noise_reduction_in_the_chain() {
-    for c in [
-        "H7-nr-bc1-pink",
-        "H7-nr-bc1-white",
-        "H7-nr-bc1-b5in",
-        "H7-nr-att30-sens12-pink",
-    ] {
-        golden(c, NR_BAR);
-    }
+    // Measured −121.1, −120.9, −114.8, −117.4 dB.
+    golden("H7-nr-bc1-pink", below(-113.0));
+    golden("H7-nr-bc1-white", below(-113.0));
+    golden("H7-nr-bc1-b5in", below(-107.0));
+    golden("H7-nr-att30-sens12-pink", below(-110.0));
 }
 
+/// Full chain on recorded speech. The de-esser and compressor stay nearly
+/// idle on this input, so these cases mainly cover the
+/// de-popper, NR, expander, voice EQ and limiter together.
 #[test]
 fn h8_full_chain() {
-    for c in [
-        "H8-full-b5state-b5in",
-        "H8-full-b5state-b5in-smooth0",
-        "H8-full-fm-b5in",
-        "H8-full-am-b5in",
-    ] {
-        golden(c, NR_BAR);
-    }
+    // Measured −89.1, −89.1, −82.6, −100.9 dB.
+    golden("H8-full-b5state-b5in", below(-81.0));
+    golden("H8-full-b5state-b5in-smooth0", below(-81.0));
+    golden("H8-full-fm-b5in", below(-75.0));
+    golden("H8-full-am-b5in", below(-93.0));
 }
 
 #[test]
 fn h9_stereo_full_chain() {
-    golden("H9-stereo-bc1", NR_BAR);
-    golden("H9-stereo-bc1-bal0.5", NR_BAR);
+    // Measured −90.2, −89.9 dB.
+    golden("H9-stereo-bc1", below(-82.0));
+    golden("H9-stereo-bc1-bal0.5", below(-82.0));
+}
+
+/// Each case that claims to cover a dynamics parameter must fail when that
+/// parameter is wrong (several cases used to pass bit-exact with a ratio,
+/// attack or release off by ×2). Some parameters can't be checked with the
+/// existing recordings yet.
+#[test]
+fn cases_notice_wrong_dynamics_parameters() {
+    let scale = |name: &'static str, k: f32| {
+        move |p: &mut BvParams| {
+            let id = BvParams::id(name).unwrap();
+            p.set_f(id, p.f(id) * k);
+        }
+    };
+    let shift = |name: &'static str, d: f32| {
+        move |p: &mut BvParams| {
+            let id = BvParams::id(name).unwrap();
+            p.set_f(id, p.f(id) + d);
+        }
+    };
+    type Mutation = Box<dyn Fn(&mut BvParams)>;
+    let cases: Vec<(&str, Expect, &str, Mutation)> = vec![
+        (
+            "H3-exp-bc1-stair",
+            stair(0.4, Dyn::Exp),
+            "exp.ratio ×2",
+            Box::new(scale("exp.ratio", 2.0)),
+        ),
+        (
+            "H3-exp-bc1-stair",
+            stair(0.4, Dyn::Exp),
+            "exp.thresh +3 dB",
+            Box::new(shift("exp.thresh", 3.0)),
+        ),
+        (
+            "H3-exp-bc1-bursts",
+            engages(Dyn::Exp, EXACT),
+            "exp.release ×2",
+            Box::new(scale("exp.release", 2.0)),
+        ),
+        (
+            "H4-comp-bc1-stair",
+            stair(0.4, Dyn::Comp),
+            "comp.ratio ×2",
+            Box::new(scale("comp.ratio", 2.0)),
+        ),
+        (
+            "H4-comp-r10-t20-stair",
+            stair(0.4, Dyn::Comp),
+            "comp.thresh +3 dB",
+            Box::new(shift("comp.thresh", 3.0)),
+        ),
+        (
+            "H4-comp-a10-r50-bursts",
+            engages(Dyn::Comp, EXACT),
+            "comp.attack ×2",
+            Box::new(scale("comp.attack", 2.0)),
+        ),
+        (
+            "H4-comp-a10-r50-bursts",
+            engages(Dyn::Comp, EXACT),
+            "comp.release ×2",
+            Box::new(scale("comp.release", 2.0)),
+        ),
+        (
+            "H5-des-bc1-sibilant",
+            engages(Dyn::Des, EXACT),
+            "des.ratio ×2",
+            Box::new(scale("des.ratio", 2.0)),
+        ),
+        (
+            "H5-des-bc1-sibilant",
+            engages(Dyn::Des, EXACT),
+            "des.thresh +3 dB",
+            Box::new(shift("des.thresh", 3.0)),
+        ),
+        (
+            "H6-lim-a1-r50-burstshot",
+            engages(Dyn::Lim, EXACT),
+            "lim.release ×2",
+            Box::new(scale("lim.release", 2.0)),
+        ),
+        (
+            "H6-lim-a1-r50-burstshot",
+            engages(Dyn::Lim, EXACT),
+            "lim.attack ×2",
+            Box::new(scale("lim.attack", 2.0)),
+        ),
+    ];
+    for (name, e, what, mutate) in cases {
+        let Some(c) = load_and_run_with(name, &*mutate) else {
+            return;
+        };
+        let (line, fails) = verdict(&c, &e);
+        eprintln!("{line}  [{what}]");
+        assert!(!fails.is_empty(), "{name} still passes with {what}");
+    }
 }
 
 /// gproxd's mic node: mono in, one output channel (balance 0), host quantum
 /// 256 and an odd one. Must equal the reference L channel within the −40 dB bar.
 #[test]
 fn h8_mono_node_output() {
-    for (name, quantum) in [("H8-full-b5state-b5in", 256), ("H8-full-fm-b5in", 1000)] {
+    // Bars as in h8_full_chain.
+    for (name, quantum, bar) in [
+        ("H8-full-b5state-b5in", 256, -81.0),
+        ("H8-full-fm-b5in", 1000, -75.0),
+    ] {
         let dir = session_dir().join(name);
         if !dir.is_dir() {
-            eprintln!("SKIP: {} missing (gitignored, local only)", dir.display());
+            skip(format_args!(
+                "{} missing (gitignored, local only)",
+                dir.display()
+            ));
             return;
         }
         let job = parse_json(&std::fs::read_to_string(dir.join("job.json")).unwrap());
@@ -585,6 +749,6 @@ fn h8_mono_node_output() {
         }
         let res = 10.0 * (e2 / s2).log10();
         eprintln!("{name} mono node, quantum {quantum}: residual {res:.1} dB");
-        assert!(res <= -40.0, "{name}: {res:.1} dB");
+        assert!(res <= bar, "{name}: {res:.1} dB > {bar} dB");
     }
 }

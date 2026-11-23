@@ -67,11 +67,23 @@ pub enum VoiceShape {
 }
 
 /// Voice-EQ band design. Returns `None` when `f0 ≥ fs/2` (the engine then
-/// keeps this band's and the following bands' previous taps).
+/// keeps this band's and the following bands' previous taps), and also, as a
+/// gprox safeguard, for a design that isn't a stable filter
+/// ([`Taps::is_stable`]; e.g. width 0 or f0 ≤ 0).
 pub fn design_voice(shape: VoiceShape, f0: f32, width: f32, gain_db: f32, fs: u32) -> Option<Taps> {
     if f0 >= (fs / 2) as f32 {
         return None;
     }
+    design_voice_unchecked(shape, f0, width, gain_db, fs).filter(Taps::is_stable)
+}
+
+fn design_voice_unchecked(
+    shape: VoiceShape,
+    f0: f32,
+    width: f32,
+    gain_db: f32,
+    fs: u32,
+) -> Option<Taps> {
     let v = 10f64.powf(f64::from(gain_db) / 20.0);
     let a = v.sqrt();
     let w0 = TAU * f64::from(f0) / f64::from(fs);

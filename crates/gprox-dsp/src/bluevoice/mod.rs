@@ -403,6 +403,20 @@ impl BlueVoice {
         self.end_block();
     }
 
+    /// Clear every module's signal state, keeping parameters, smoothers and
+    /// fades. Used when a block came out non-finite (overflow from huge
+    /// input, or a parameter set the DSP can't run), so the chain works again
+    /// with the next good block instead of carrying NaN for good.
+    fn clear_state(&mut self) {
+        self.dpop.reset();
+        self.nr.reset();
+        self.exp.clear();
+        self.des.clear();
+        self.veq.reset();
+        self.comp.reset();
+        self.lim.reset();
+    }
+
     /// Process planar input (1 = mono mic, or 2 channels) into up to two
     /// output channels (L, R). Output lags the engine by
     /// [`Self::FIFO_LATENCY`] frames at 48 kHz (one engine block in general).
@@ -418,7 +432,11 @@ impl BlueVoice {
                 match input.get(c) {
                     Some(s) if c < nch => {
                         let avail = s.len().saturating_sub(pos).min(n);
-                        dst[..avail].copy_from_slice(&s[pos..pos + avail]);
+                        // NaN/Inf from the source counts as 0 (it would stay
+                        // in the recursive filters).
+                        for (d, &v) in dst[..avail].iter_mut().zip(&s[pos..pos + avail]) {
+                            *d = if v.is_finite() { v } else { 0.0 };
+                        }
                         dst[avail..].fill(0.0);
                     }
                     _ => dst.fill(0.0),
@@ -432,6 +450,14 @@ impl BlueVoice {
             if self.fill == blk {
                 self.work = self.fifo_in;
                 self.run_block(nch);
+                if !self
+                    .work
+                    .iter()
+                    .all(|w| w[..blk].iter().all(|v| v.is_finite()))
+                {
+                    self.clear_state();
+                    self.work = [[0.0; MAX_BLOCK]; CH];
+                }
                 self.fifo_out = self.work;
                 self.fill = 0;
             }
@@ -536,5 +562,89 @@ mod tests {
         h.set(&p);
         run(&mut bv, &x, 256);
         assert_eq!(bv.params().f(P::Volume), 0.5);
+    }
+}
+
+#[cfg(test)]
+mod non_finite_tests {
+    use super::*;
+
+    fn run(bv: &mut BlueVoice, x: &[f32]) -> Vec<f32> {
+        let mut l = vec![0.0; x.len()];
+        let mut r = vec![0.0; x.len()];
+        for ((xi, li), ri) in x.chunks(256).zip(l.chunks_mut(256)).zip(r.chunks_mut(256)) {
+            bv.process(&[xi], &mut [li, ri]);
+        }
+        l
+    }
+
+    fn voice(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| (i as f32 * 0.05).sin() * 0.3 * if i % 12_000 < 8000 { 1.0 } else { 0.1 })
+            .collect()
+    }
+
+    /// A value the DSP can't run must not make the
+    /// mic output NaN, and the good preset must work again afterwards.
+    #[test]
+    fn bad_values_do_not_poison_the_chain() {
+        let bad: [&[(P, f32)]; 5] = [
+            &[(P::VeqLowWidth, 0.0)],
+            &[(P::VeqMidFreq, 0.0), (P::VeqMidWidth, 0.0)],
+            &[(P::DesFreq, 30_000.0)],
+            &[(P::DpopFreq, 30_000.0)],
+            &[(P::DpopFreq, -80.0)],
+        ];
+        let x = voice(48_000);
+        for set in bad {
+            let good = BvParams::broadcaster1();
+            let mut p = good;
+            for &(id, v) in set {
+                p.set_f(id, v);
+            }
+            let (mut bv, mut h) = BlueVoice::new_shared(&p);
+            let y = run(&mut bv, &x);
+            assert!(
+                y.iter().all(|v| v.is_finite()),
+                "{set:?}: non-finite output"
+            );
+            h.set(&good);
+            let y = run(&mut bv, &x);
+            assert!(y.iter().all(|v| v.is_finite()), "{set:?}: still non-finite");
+            let late = &y[24_000..];
+            assert!(
+                late.iter().any(|v| v.abs() > 0.01),
+                "{set:?}: silent on the good preset"
+            );
+        }
+    }
+
+    /// One NaN or Inf sample on the mic input counts as 0.
+    #[test]
+    fn nan_input_sample_counts_as_zero() {
+        let p = BvParams::broadcaster1();
+        let x = voice(24_000);
+        for bad in [f32::NAN, f32::INFINITY] {
+            let mut xb = x.clone();
+            xb[5000] = bad;
+            let mut x0 = x.clone();
+            x0[5000] = 0.0;
+            let y = run(&mut BlueVoice::new(&p), &xb);
+            assert_eq!(y, run(&mut BlueVoice::new(&p), &x0), "{bad}");
+        }
+    }
+
+    /// Input huge enough to overflow the filters: output stays finite and the
+    /// chain works again once the input is normal.
+    #[test]
+    fn overflow_recovers() {
+        let p = BvParams::broadcaster1();
+        let mut x = voice(48_000);
+        for v in &mut x[4000..4100] {
+            *v = 3.0e38;
+        }
+        let y = run(&mut BlueVoice::new(&p), &x);
+        assert!(y.iter().all(|v| v.is_finite()));
+        assert!(y[24_000..].iter().any(|v| v.abs() > 0.01));
     }
 }

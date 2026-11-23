@@ -21,6 +21,28 @@
 //! On every (re)connect the worker re-sends the user's sidetone level if one
 //! was set through gprox, as G HUB does after power-on. Other
 //! than that, nothing is written unless a client asks.
+//!
+//! # Reply attribution
+//!
+//! Feature commands go to indices from Root.getFeature, and a getFeature
+//! reply (`11 ff 00 0b <index>`) does not say which feature it answers. With
+//! one fixed sw_id (G HUB's, [`crate::hidpp::SW_ID`]) a late reply to an
+//! earlier lookup, or another program's lookup reply with the same sw_id
+//! (hidraw gives every reader every input report), would be taken for the
+//! answer and send later commands to the wrong feature: a read can become a
+//! write, or a frame can reach a feature outside the allow-list. So the
+//! worker counts Root requests sent and Root replies with its sw_id seen, and
+//! only uses a map when the counts show every reply was its own:
+//!
+//! - a lookup starts only when no earlier Root reply is still due (it waits
+//!   up to [`STALE_AFTER`] after the last Root request for one that timed out);
+//! - after the lookups it listens for [`SETTLE`]; an extra Root reply in that
+//!   window, or one that was already taken, means a reply was mis-attributed
+//!   and the map is thrown away (retried at the next probe);
+//! - a map that differs from the last one accepted is looked up once more
+//!   before it is used;
+//! - an unexplained Root reply while connected drops the map: feature
+//!   commands (and so writes) are refused until a new lookup passes.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -31,7 +53,7 @@ use gprox_core::control::{BatteryStatus, HeadsetStatus};
 
 use crate::hidpp::{
     AutoOffMinutes, BatteryReading, Command, Feature, FeatureMap, HidppError, Message,
-    SidetoneLevel, hex,
+    SidetoneLevel, Target, hex,
 };
 use crate::hidraw::{Hidraw, Incoming, Transport};
 use crate::mute::{AFTER_POWER, AFTER_WRITE, AudioObservation, MuteTracker};
@@ -45,6 +67,12 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 const SCAN_INTERVAL: Duration = Duration::from_secs(1);
 /// Wall clock vs monotonic drift that counts as a resume from sleep.
 const RESUME_DRIFT: Duration = Duration::from_secs(5);
+/// How long after the feature lookups the worker listens for a Root reply
+/// that no request explains (the device answers within ~50 ms).
+const SETTLE: Duration = Duration::from_millis(200);
+/// How long a Root reply that timed out can still arrive late. After this it
+/// counts as lost (the headset was off or out of range).
+const STALE_AFTER: Duration = Duration::from_secs(3);
 
 /// Asked on every worker tick for what the mic path has seen (mute
 /// detection, [`crate::mute`]).
@@ -158,6 +186,8 @@ impl HeadsetService {
             dev: None,
             generation: 0,
             pending: VecDeque::new(),
+            root: RootReplies::default(),
+            verified: None,
             tracker: ChargeTracker::default(),
             mute: MuteTracker::default(),
             clock: (Instant::now(), SystemTime::now()),
@@ -212,8 +242,13 @@ enum TxError {
     Timeout,
     /// HID++ error reply.
     Device(u8),
-    /// The device node went away or a write failed.
+    /// The device node went away (the reader saw the end of the stream).
     Gone(String),
+    /// Writing to the node failed while it may still be there. The node stays
+    /// open: its reader only ends when the node goes away, so closing and
+    /// reopening here would leak a blocked reader thread and its file
+    /// descriptor per retry.
+    Write(String),
     Hidpp(HidppError),
 }
 
@@ -223,8 +258,41 @@ impl std::fmt::Display for TxError {
             TxError::Timeout => write!(f, "no reply from the headset"),
             TxError::Device(c) => write!(f, "HID++ error {c:#04x}"),
             TxError::Gone(e) => write!(f, "dongle gone: {e}"),
+            TxError::Write(e) => write!(f, "write to the headset dongle failed: {e}"),
             TxError::Hidpp(e) => write!(f, "{e}"),
         }
+    }
+}
+
+/// Root requests sent and Root replies with gprox's sw_id seen, since the
+/// dongle was opened ("Reply attribution" in the module docs).
+#[derive(Debug, Default)]
+struct RootReplies {
+    sent: u32,
+    seen: u32,
+    last_sent: Option<Instant>,
+    /// A Root reply arrived that no request explains: some lookup answer
+    /// may have been somebody else's.
+    unexplained: bool,
+}
+
+impl RootReplies {
+    fn sent(&mut self) {
+        self.sent += 1;
+        self.last_sent = Some(Instant::now());
+    }
+
+    fn seen(&mut self) {
+        self.seen += 1;
+        if self.seen > self.sent {
+            self.unexplained = true;
+        }
+    }
+
+    /// Forget lost and foreign replies before a lookup.
+    fn rebase(&mut self) {
+        self.seen = self.sent;
+        self.unexplained = false;
     }
 }
 
@@ -239,6 +307,9 @@ struct Worker {
     generation: u64,
     /// Events that arrived while waiting for a reply.
     pending: VecDeque<Event>,
+    root: RootReplies,
+    /// The last feature map that passed the attribution checks.
+    verified: Option<FeatureMap>,
     tracker: ChargeTracker,
     mute: MuteTracker,
     /// Last (monotonic, wall) clock pair, for resume detection.
@@ -345,6 +416,7 @@ impl Worker {
             }
             Some(Ok(transport)) => {
                 self.generation = generation;
+                self.root = RootReplies::default();
                 let now = Instant::now();
                 self.dev = Some(Device {
                     transport,
@@ -397,6 +469,17 @@ impl Worker {
         self.update(|s| *s = HeadsetStatus::default());
     }
 
+    /// A write to the node failed: keep it open, show the error, and let the
+    /// probe retry after [`Config::probe_interval`].
+    fn write_failed(&mut self, msg: &str) {
+        if self.snapshot().error.as_deref() != Some(msg) {
+            tracing::warn!("{msg}");
+        }
+        self.mark_off(msg);
+        let msg = msg.to_owned();
+        self.update(|s| s.error = Some(msg));
+    }
+
     fn mark_off(&mut self, why: &str) {
         if let Some(d) = &mut self.dev {
             if d.connected {
@@ -422,13 +505,22 @@ impl Worker {
         let Some(d) = &mut self.dev else {
             return Err(TxError::Gone("no dongle".into()));
         };
+        let root = cmd.target() == Target::Root;
+        if !root && self.root.unexplained {
+            return Err(TxError::Hidpp(HidppError::Protocol(
+                "an unexplained HID++ reply arrived; the feature map is not trusted".into(),
+            )));
+        }
         let report = cmd.encode(&d.map).map_err(TxError::Hidpp)?;
         if cmd.is_write() {
             tracing::info!(?cmd, frame = %hex(report.as_bytes()), "HID++ write");
         }
         d.transport
             .send(&report)
-            .map_err(|e| TxError::Gone(e.to_string()))?;
+            .map_err(|e| TxError::Write(e.to_string()))?;
+        if root {
+            self.root.sent();
+        }
         if cmd.is_write() {
             // The dongle answers a write with a consumer-control report
             // that is not a mute press.
@@ -455,12 +547,20 @@ impl Worker {
                     let Some(d) = &self.dev else {
                         return Err(TxError::Gone("no dongle".into()));
                     };
+                    let root_reply = msg.is_root_reply();
+                    if root_reply {
+                        self.root.seen();
+                    }
                     if cmd.answers(&d.map, &msg) {
                         return match msg {
                             Message::Reply { params, .. } => Ok(params),
                             Message::Error { code, .. } => Err(TxError::Device(code)),
                             _ => unreachable!("answers() only matches replies and errors"),
                         };
+                    }
+                    if root_reply {
+                        tracing::debug!(report = %hex(&data), "unexplained HID++ Root reply");
+                        continue;
                     }
                     self.pending.push_back(Event::Input {
                         generation,
@@ -482,6 +582,10 @@ impl Worker {
                 self.drop_device(&e);
                 None
             }
+            Err(e @ TxError::Write(_)) => {
+                self.write_failed(&e.to_string());
+                None
+            }
             Err(e) => {
                 tracing::debug!(?cmd, error = %e, "HID++ request failed");
                 self.mark_off(&e.to_string());
@@ -490,23 +594,109 @@ impl Worker {
         }
     }
 
+    /// Move everything queued to `pending`, counting and dropping Root
+    /// replies (they answer nothing any more).
+    fn drain_root_replies(&mut self) {
+        while let Ok(ev) = self.rx.try_recv() {
+            self.pending.push_back(ev);
+        }
+        let generation = self.generation;
+        let before = self.pending.len();
+        self.pending.retain(|ev| {
+            !matches!(ev, Event::Input { generation: g, data: Ok(d), .. }
+                if *g == generation && Message::parse(d).is_root_reply())
+        });
+        for _ in self.pending.len()..before {
+            self.root.seen();
+        }
+    }
+
+    /// Listen for [`SETTLE`] after the lookups; false if a Root reply that no
+    /// request explains arrived (now or during the lookups).
+    fn settle(&mut self) -> bool {
+        let deadline = Instant::now() + SETTLE;
+        while !self.root.unexplained {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match self.rx.recv_timeout(left) {
+                Ok(Event::Input {
+                    generation,
+                    data: Ok(data),
+                    ..
+                }) if generation == self.generation && Message::parse(&data).is_root_reply() => {
+                    self.root.seen();
+                }
+                Ok(ev) => self.pending.push_back(ev),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+        !self.root.unexplained
+    }
+
+    /// The lookup result can't be trusted: headset counts as off, the probe
+    /// tries again.
+    fn reject_map(&mut self, why: &str) {
+        tracing::warn!("headset feature lookup not used: {why}");
+        self.mark_off(why);
+        let msg = format!("headset feature lookup not used: {why}; retrying");
+        self.update(|s| s.error = Some(msg));
+    }
+
+    /// Look the features up; `None` if the result can't be used (the reason
+    /// is handled here).
+    fn look_up_features(&mut self) -> Option<FeatureMap> {
+        self.drain_root_replies();
+        if self.root.seen < self.root.sent
+            && let Some(due) = self.root.last_sent.map(|t| t + STALE_AFTER)
+            && Instant::now() < due
+        {
+            tracing::debug!("waiting for a late HID++ reply before the feature lookup");
+            self.mark_off("waiting for a late HID++ reply");
+            if let Some(d) = &mut self.dev {
+                d.next_probe = due;
+            }
+            return None;
+        }
+        self.root.rebase();
+        let mut map = FeatureMap::default();
+        for f in Feature::ALL {
+            let p = self.call(Command::GetFeature(f))?;
+            if let Err(e) = map.set(f, p[0]) {
+                tracing::warn!(error = %e, "headset feature table");
+                self.mark_off(&e.to_string());
+                return None;
+            }
+        }
+        if !self.settle() {
+            self.reject_map(
+                "a HID++ reply arrived that gprox did not ask for \
+                 (a late reply, or another program using the same sw_id)",
+            );
+            return None;
+        }
+        if self.verified.as_ref().is_some_and(|v| *v != map) {
+            tracing::warn!(old = ?self.verified, new = ?map, "headset feature table changed");
+            self.verified = Some(map);
+            self.reject_map("the feature table changed; checking it again");
+            return None;
+        }
+        self.verified = Some(map.clone());
+        Some(map)
+    }
+
     /// (Re-)read everything after an open, power-on or resume.
     fn sync(&mut self) {
         let Some(d) = &mut self.dev else { return };
         d.resync = false;
         d.map = FeatureMap::default();
-        for f in Feature::ALL {
-            let Some(p) = self.call(Command::GetFeature(f)) else {
-                return;
-            };
-            let Some(d) = &mut self.dev else { return };
-            if let Err(e) = d.map.set(f, p[0]) {
-                tracing::warn!(error = %e, "headset feature table");
-                self.mark_off(&e.to_string());
-                return;
-            }
-        }
+        let Some(map) = self.look_up_features() else {
+            return;
+        };
         if let Some(d) = &mut self.dev {
+            d.map = map;
             if !d.connected {
                 tracing::info!(map = ?d.map, "headset connected");
             }
@@ -617,6 +807,17 @@ impl Worker {
                 tracing::trace!(report = %hex(b), "other input report");
                 self.mute.report(at, b);
             }
+            ref m if m.is_root_reply() => {
+                self.root.seen();
+                if self.root.unexplained && d.connected {
+                    tracing::warn!(
+                        report = %hex(data),
+                        "unexplained HID++ Root reply (another program using the same \
+                         sw_id?): feature map dropped until the next lookup"
+                    );
+                    self.mark_off("unexplained HID++ reply");
+                }
+            }
             m => tracing::debug!(?m, "unexpected HID++ input"),
         }
     }
@@ -650,6 +851,7 @@ impl Worker {
                 let msg = e.to_string();
                 match e {
                     TxError::Gone(why) => self.drop_device(&why),
+                    TxError::Write(_) => self.write_failed(&msg),
                     TxError::Timeout => self.mark_off(&msg),
                     TxError::Device(_) | TxError::Hidpp(_) => {}
                 }

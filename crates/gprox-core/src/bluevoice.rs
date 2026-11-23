@@ -21,8 +21,11 @@
 //! low_gain = 2.0
 //! ```
 //!
-//! Parameter names aren't checked here (the engine owns the list and rejects
-//! unknown names when the preset is applied); values must be finite.
+//! Names must be engine parameters and values inside [`PARAM_RANGES`]: G HUB's
+//! own slider limits where its UI defines them, so every preset G HUB writes
+//! passes, and values the DSP can't run (a zero filter width, a frequency
+//! above half the sample rate, a +40 dB output volume) are refused when the
+//! preset is read rather than turning the mic output into NaN.
 
 use std::collections::BTreeMap;
 
@@ -59,6 +62,15 @@ pub enum BlueVoicePresetError {
     BadName(String),
     #[error("parameter {name}: {value} is not finite")]
     NotFinite { name: String, value: f32 },
+    #[error("unknown Blue VO!CE parameter {0:?}")]
+    Unknown(String),
+    #[error("parameter {name}: {value} is outside {lo}…{hi}")]
+    OutOfRange {
+        name: String,
+        value: f32,
+        lo: f32,
+        hi: f32,
+    },
     #[error("input_gain {0} is outside 0…1")]
     InputGain(f32),
 }
@@ -104,7 +116,8 @@ impl BlueVoicePreset {
         Ok(toml::to_string(self)?)
     }
 
-    /// Names must be `<block>.<param>`, values finite, `input_gain` in 0…1.
+    /// Names must be engine parameters, values finite and inside
+    /// [`PARAM_RANGES`], `input_gain` in 0…1.
     pub fn validate(&self) -> Result<(), BlueVoicePresetError> {
         for (b, m) in &self.engine {
             for (k, &v) in m {
@@ -113,6 +126,16 @@ impl BlueVoicePreset {
                 if !v.is_finite() {
                     return Err(BlueVoicePresetError::NotFinite { name, value: v });
                 }
+                let (lo, hi) = param_range(&name)
+                    .ok_or_else(|| BlueVoicePresetError::Unknown(name.clone()))?;
+                if !(lo..=hi).contains(&v) {
+                    return Err(BlueVoicePresetError::OutOfRange {
+                        name,
+                        value: v,
+                        lo,
+                        hi,
+                    });
+                }
             }
         }
         match self.input_gain {
@@ -120,6 +143,81 @@ impl BlueVoicePreset {
             _ => Ok(()),
         }
     }
+}
+
+/// 10^(±15/20): G HUB's voice-EQ gain limits (±15 dB, linear), widened by
+/// one part in 10⁶ so the `f32` values G HUB stores pass.
+const VEQ_GAIN: (f32, f32) = (0.177_827_9 * (1.0 - 1e-6), 5.623_413 * (1.0 + 1e-6));
+/// 10^(±20/20): G HUB's limiter boost slider (±20 dB, linear).
+const BOOST: (f32, f32) = (0.1 * (1.0 - 1e-6), 10.0 * (1.0 + 1e-6));
+
+/// Allowed value range of every engine parameter, inclusive.
+///
+/// From G HUB's Blue VO!CE panel definition (in its UI bundle): voice EQ
+/// frequencies, widths and ±15 dB
+/// gains, de-popper frequency, NR, expander, de-esser, compressor and
+/// limiter sliders. All 243 Blue VO!CE presets we have seen (G HUB's
+/// built-in, downloaded and own) are inside them. Not in the panel, so
+/// chosen here to be safe for the DSP and wider than any preset seen:
+/// `micopt.volume` 0…+12 dB (presets 0.65–1), `micopt.balance` −1…1,
+/// `comp.makeup` 0…+20 dB (presets 1), `exp.thresh_auto_sense` 0…60 dB
+/// (presets 20). Switches are 0 or 1. `micopt.meter_enable` (meters only) is
+/// accepted and ignored by the engine.
+pub const PARAM_RANGES: &[(&str, f32, f32)] = &[
+    ("micopt.enable", 0.0, 1.0),
+    ("micopt.balance", -1.0, 1.0),
+    ("micopt.volume", 0.0, 3.981_072),
+    ("micopt.meter_enable", 0.0, 1.0),
+    ("dpop.enable", 0.0, 1.0),
+    ("dpop.freq", 20.0, 400.0),
+    ("nr.enable", 0.0, 1.0),
+    ("nr.release", 0.0, 1000.0),
+    ("nr.sensitivity", 0.0, 40.0),
+    ("nr.bias", 0.0, 5.0),
+    ("nr.attenuation_max", -60.0, 0.0),
+    ("exp.enable", 0.0, 1.0),
+    ("exp.attack", 0.0, 200.0),
+    ("exp.release", 50.0, 1000.0),
+    ("exp.hysteresis", 0.0, 200.0),
+    ("exp.ratio", 1.0, 20.0),
+    ("exp.thresh", -72.0, -24.0),
+    ("exp.thresh_auto_enable", 0.0, 1.0),
+    ("exp.thresh_auto_sense", 0.0, 60.0),
+    ("exp.attenuation_max", -60.0, 0.0),
+    ("veq.enable", 0.0, 1.0),
+    ("veq.low_gain", VEQ_GAIN.0, VEQ_GAIN.1),
+    ("veq.low_freq", 80.0, 600.0),
+    ("veq.low_width", 0.5, 10.0),
+    ("veq.mid_gain", VEQ_GAIN.0, VEQ_GAIN.1),
+    ("veq.mid_freq", 400.0, 5000.0),
+    ("veq.mid_width", 0.5, 10.0),
+    ("veq.high_gain", VEQ_GAIN.0, VEQ_GAIN.1),
+    ("veq.high_freq", 3000.0, 12_000.0),
+    ("veq.high_width", 0.5, 10.0),
+    ("des.enable", 0.0, 1.0),
+    ("des.attack", 0.0, 200.0),
+    ("des.release", 50.0, 1000.0),
+    ("des.ratio", 1.0, 20.0),
+    ("des.thresh", -24.0, 24.0),
+    ("des.freq", 3000.0, 12_000.0),
+    ("comp.enable", 0.0, 1.0),
+    ("comp.attack", 0.0, 200.0),
+    ("comp.release", 50.0, 1000.0),
+    ("comp.ratio", 1.0, 20.0),
+    ("comp.thresh", -48.0, 0.0),
+    ("comp.makeup", 0.0, 10.0),
+    ("lim.boost", BOOST.0, BOOST.1),
+    ("lim.attack", 0.0, 10.0),
+    ("lim.release", 10.0, 250.0),
+];
+
+/// The allowed range of an engine parameter, `None` if there is no such
+/// parameter.
+pub fn param_range(name: &str) -> Option<(f32, f32)> {
+    PARAM_RANGES
+        .iter()
+        .find(|&&(n, _, _)| n == name)
+        .map(|&(_, lo, hi)| (lo, hi))
 }
 
 fn split_name(full: &str) -> Result<(&str, &str), BlueVoicePresetError> {
@@ -189,9 +287,48 @@ mod tests {
     fn rejects_bad_input() {
         assert!(BlueVoicePreset::from_params("x", [("nodot", 1.0)]).is_err());
         assert!(BlueVoicePreset::from_params("x", [("a.b.c", 1.0)]).is_err());
-        assert!(BlueVoicePreset::from_params("x", [("a.b", f32::NAN)]).is_err());
+        assert!(BlueVoicePreset::from_params("x", [("nr.bias", f32::NAN)]).is_err());
+        assert!(BlueVoicePreset::from_params("x", [("a.b", 1.0)]).is_err());
         assert!(BlueVoicePreset::from_toml_str("input_gain = 1.5").is_err());
         assert!(BlueVoicePreset::from_toml_str("gain = 1.0").is_err());
         assert!(BlueVoicePreset::from_toml_str("[engine.veq]\nlow_gain = \"x\"").is_err());
+    }
+
+    /// Values the DSP can't run and names the engine doesn't have are
+    /// refused when a preset is read.
+    #[test]
+    fn rejects_out_of_range_values_and_unknown_names() {
+        for (name, v) in [
+            ("veq.low_width", 0.0),
+            ("veq.mid_freq", 0.0),
+            ("veq.mid_width", 0.0),
+            ("des.freq", 30_000.0),
+            ("dpop.freq", 30_000.0),
+            ("dpop.freq", -80.0),
+            ("micopt.volume", 100.0),
+            ("micopt.balance", 2.0),
+            ("comp.ratio", 0.5),
+            ("veq.high_gain", 10.0),
+        ] {
+            let r = BlueVoicePreset::from_params("x", [(name, v)]);
+            assert!(
+                matches!(r, Err(BlueVoicePresetError::OutOfRange { .. })),
+                "{name} = {v}: {r:?}"
+            );
+        }
+        let r = BlueVoicePreset::from_toml_str("[engine.veq]\nlow_q = 1.0\n");
+        assert!(matches!(r, Err(BlueVoicePresetError::Unknown(_))), "{r:?}");
+        // The range ends themselves are fine, as are G HUB's ±15 dB gains.
+        BlueVoicePreset::from_params(
+            "x",
+            [
+                ("veq.low_freq", 80.0),
+                ("veq.high_freq", 12_000.0),
+                ("veq.low_gain", 0.177_827_94),
+                ("veq.mid_gain", 5.623_413),
+                ("micopt.meter_enable", 1.0),
+            ],
+        )
+        .unwrap();
     }
 }

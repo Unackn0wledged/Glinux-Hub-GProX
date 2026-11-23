@@ -104,6 +104,13 @@ impl Expander {
         self.delay.reset();
     }
 
+    /// [`Expander::reset`] plus the auto-threshold floor (after non-finite
+    /// output, [`super::BlueVoice`]).
+    pub fn clear(&mut self) {
+        self.reset();
+        self.auto_s.y = 0.0;
+    }
+
     pub fn process(&mut self, chans: &mut [&mut [f32]], n: usize, inv_sub: f32) {
         let pk = self.det.update(chan_peak(chans, n));
         let l = db(pk).max(-120.0);
@@ -267,10 +274,27 @@ impl DeEsser {
         (self.s2.ka, self.s2.kb) = (k[1][0], k[1][1]);
     }
 
-    /// Redesign the crossover for the (smoothed) frequency.
+    /// Redesign the crossover for the (smoothed) frequency. A design that
+    /// isn't a stable filter (frequency ≤ 0 or ≥ fs/2) keeps the previous
+    /// taps.
     pub fn design(&mut self, freq: f32, fs: u32) {
-        self.lp = lowpass_butter2(freq, fs);
-        self.hp = highpass_butter2(freq, fs);
+        let (lp, hp) = (lowpass_butter2(freq, fs), highpass_butter2(freq, fs));
+        if lp.is_stable() && hp.is_stable() {
+            (self.lp, self.hp) = (lp, hp);
+        }
+    }
+
+    /// Everything [`DeEsser::reset`] clears plus the band delay line (after
+    /// non-finite output, [`super::BlueVoice`]).
+    pub fn clear(&mut self) {
+        self.reset();
+        for c in self.ring.iter_mut() {
+            for band in c.iter_mut() {
+                for slot in band.iter_mut() {
+                    slot.fill(0.0);
+                }
+            }
+        }
     }
 
     pub fn reset(&mut self) {
@@ -391,6 +415,19 @@ impl Limiter {
             } else {
                 1.0
             };
+    }
+
+    /// Back to the state of a new limiter, keeping the parameters (after
+    /// non-finite output, [`super::BlueVoice`]).
+    pub fn reset(&mut self) {
+        self.det.reset();
+        self.s1.y = 1.0;
+        self.s2.y = 1.0;
+        self.s3.y = 1.0;
+        self.delay.reset();
+        self.g_in = 1.0;
+        self.g_prev = 1.0;
+        self.last_gain = 1.0;
     }
 
     pub fn process(&mut self, chans: &mut [&mut [f32]], n: usize, inv_sub: f32) {

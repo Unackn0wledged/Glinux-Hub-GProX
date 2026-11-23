@@ -7,6 +7,7 @@
 //! ghub_presets = "/path/to/pro_x_wireless_headset_device_presets.json"
 //! battery_model = "/path/to/pro_x_wireless_headset_battery.xml"
 //! sidetone = 30                 # last sidetone level set through gprox
+//! always_on_sidetone = true     # keep the headset mic stream open
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -26,6 +27,9 @@ pub struct State {
     /// Sidetone level the user set through gprox; re-applied whenever the
     /// headset connects (as G HUB does). `None` = never set, never written.
     pub sidetone: Option<u8>,
+    /// Keep the headset's mic stream open so its sidetone works with no app
+    /// recording. Off when missing.
+    pub always_on_sidetone: bool,
 }
 
 /// `$XDG_CONFIG_HOME/gprox`, else `$HOME/.config/gprox`.
@@ -79,9 +83,15 @@ mod tests {
             ghub_presets: Some("/x/presets.json".into()),
             battery_model: Some("/x/battery.xml".into()),
             sidetone: Some(30),
+            always_on_sidetone: true,
         };
         s.save(&path).unwrap();
         assert_eq!(State::load(&path), s);
+        // Files written before the setting existed: off.
+        std::fs::write(&path, "sidetone = 30\n").unwrap();
+        let old = State::load(&path);
+        assert_eq!(old.sidetone, Some(30));
+        assert!(!old.always_on_sidetone);
         std::fs::write(&path, "hp_eq = [").unwrap();
         assert_eq!(State::load(&path), State::default());
         std::fs::remove_dir_all(&dir).unwrap();

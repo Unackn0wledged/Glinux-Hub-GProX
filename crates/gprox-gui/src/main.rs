@@ -191,26 +191,51 @@ impl GproxApp {
         ui.heading("Headset");
         let h = &s.headset;
         ui.label(h.summary());
-        if !h.connected {
-            return;
-        }
         let mut req = None;
         ui.horizontal(|ui| {
-            ui.label("Sidetone");
-            let mut v = self.sidetone_drag.or(h.sidetone).unwrap_or(0);
-            let r = ui.add(egui::Slider::new(&mut v, 0..=100));
-            if r.dragged() || r.changed() {
-                self.sidetone_drag = Some(v);
+            if h.connected {
+                ui.label("Sidetone");
+                let mut v = self.sidetone_drag.or(h.sidetone).unwrap_or(0);
+                let r = ui.add(egui::Slider::new(&mut v, 0..=100));
+                if r.dragged() || r.changed() {
+                    self.sidetone_drag = Some(v);
+                }
+                // Send once the slider is let go (or changed by keyboard/click),
+                // not on every drag step: each value is one HID++ write.
+                if (r.drag_stopped() || (r.changed() && !r.dragged()))
+                    && let Some(level) = self.sidetone_drag.take()
+                    && Some(level) != h.sidetone
+                {
+                    req = Some(Request::SetSidetone { level });
+                }
             }
-            // Send once the slider is let go (or changed by keyboard/click),
-            // not on every drag step: each value is one HID++ write.
-            if (r.drag_stopped() || (r.changed() && !r.dragged()))
-                && let Some(level) = self.sidetone_drag.take()
-                && Some(level) != h.sidetone
+            // No HID involved, so it can be set with the headset off too.
+            let mut always = h.always_on_sidetone;
+            if ui
+                .checkbox(
+                    &mut always,
+                    if h.connected {
+                        "Always on"
+                    } else {
+                        "Always-on sidetone"
+                    },
+                )
+                .on_hover_text(
+                    "Always-on sidetone: keep the headset's mic stream open so sidetone works \
+                     even when no app uses the mic. The headset only mixes sidetone while its \
+                     mic streams.",
+                )
+                .changed()
             {
-                req = Some(Request::SetSidetone { level });
+                req = Some(Request::SetAlwaysOnSidetone { on: always });
             }
         });
+        if !h.connected {
+            if let Some(r) = req {
+                self.call(r);
+            }
+            return;
+        }
         ui.horizontal(|ui| {
             ui.label("Auto-off");
             let label = |m: u8| {

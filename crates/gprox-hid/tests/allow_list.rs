@@ -93,7 +93,13 @@ fn all_commands() -> Vec<Command> {
             v.push(Command::SetAutoOff(m));
         }
     }
-    // Exhaustiveness guard: a new variant must be added above and to ALLOW.
+    // Exhaustiveness guards: a new `Feature` or `Command` variant breaks one
+    // of these matches until it is in `Feature::ALL`, above, and in ALLOW.
+    let position = |f: Feature| match f {
+        Feature::Sidetone => 0,
+        Feature::AdcMeasurement => 1,
+    };
+    assert_eq!(Feature::ALL.map(position), [0, 1], "Feature::ALL");
     for c in &v {
         let _: () = match c {
             Command::GetProtocolVersion { .. }

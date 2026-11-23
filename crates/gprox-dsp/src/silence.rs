@@ -84,6 +84,30 @@ impl SilenceMeter {
     }
 }
 
+/// Makes [`SilenceMeter`]s for one [`SilenceProbe`], for a stream that is
+/// re-created while the probe lives on: each new meter continues the frame
+/// count of the one before. Only one meter may be in use at a time.
+#[derive(Debug, Clone)]
+pub struct MeterSource {
+    shared: Arc<Shared>,
+}
+
+impl MeterSource {
+    /// A meter that continues where the last one stopped.
+    pub fn meter(&self) -> SilenceMeter {
+        SilenceMeter {
+            shared: self.shared.clone(),
+            frames: self.shared.frames.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A probe whose meters come from a [`MeterSource`] (none running yet).
+pub fn silence_meter_source(rate: u32) -> (MeterSource, SilenceProbe) {
+    let (m, p) = silence_meter(rate);
+    (MeterSource { shared: m.shared }, p)
+}
+
 /// No frames for this long means the stream stopped.
 const STALE: Duration = Duration::from_secs(2);
 
@@ -168,5 +192,32 @@ mod tests {
         let a = p.poll_at(t2);
         assert_eq!(a.stream_started, Some(t2 - Duration::from_millis(100)));
         assert_eq!(a.last_audio, Some(got), "old audio keeps its time");
+    }
+
+    /// A stream that is re-created gets a new meter on the same probe: the
+    /// frame count continues, a restart after a pause is a new start, and
+    /// audio is dated as before.
+    #[test]
+    fn meters_from_a_source_continue_the_count() {
+        let (src, mut p) = silence_meter_source(48_000);
+        let t0 = Instant::now();
+        assert_eq!(p.poll_at(t0), MicActivity::default());
+        let mut m = src.meter();
+        m.observe(&[0.0f32; 4_800]);
+        let a = p.poll_at(t0 + Duration::from_secs(1));
+        assert_eq!(a.stream_started, Some(t0 + Duration::from_millis(900)));
+        drop(m);
+        // Re-created later: a new start, and its audio is dated correctly.
+        let t1 = t0 + Duration::from_secs(1) + STALE + Duration::from_secs(1);
+        let mut m = src.meter();
+        let mut block = [0.0f32; 9_600];
+        block[4_799] = 0.5;
+        m.observe(&block);
+        let a = p.poll_at(t1);
+        assert_eq!(a.stream_started, Some(t1 - Duration::from_millis(200)));
+        let want = t1 - Duration::from_millis(100);
+        let got = a.last_audio.unwrap();
+        let d = if got > want { got - want } else { want - got };
+        assert!(d < Duration::from_millis(1), "{d:?}");
     }
 }

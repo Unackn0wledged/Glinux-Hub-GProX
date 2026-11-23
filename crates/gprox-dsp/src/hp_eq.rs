@@ -485,12 +485,25 @@ impl<K: CascadeKernel> HeadphoneEq<K> {
 
     /// Filter planar channels in place. Channels beyond [`MAX_CHANNELS`] are
     /// left untouched. Real-time safe.
+    ///
+    /// The filters are recursive, so one NaN or Inf would stay in their state
+    /// for good. Non-finite input samples are replaced by 0 before filtering,
+    /// and a channel whose state is not finite after the call (overflow from
+    /// huge finite input) is reset and outputs silence for that call. Finite
+    /// input that doesn't overflow is processed exactly as before.
     pub fn process_in_place(&mut self, chans: &mut [&mut [f32]]) {
         if let Some(w) = self.reader.as_mut().and_then(ParamReader::poll) {
             self.ctl.apply(&HpEqSettings::from_words(&w));
         }
         let frames = chans.iter().map(|c| c.len()).min().unwrap_or(0);
         let nst = BANDS * K::STATE_LEN;
+        for buf in chans.iter_mut().take(MAX_CHANNELS) {
+            for v in buf[..frames].iter_mut() {
+                if !v.is_finite() {
+                    *v = 0.0;
+                }
+            }
+        }
         let mut pos = 0;
         while pos < frames {
             if self.until_tick == 0 {
@@ -512,6 +525,12 @@ impl<K: CascadeKernel> HeadphoneEq<K> {
             }
             pos += n;
             self.until_tick -= n;
+        }
+        for (buf, st) in chans.iter_mut().zip(self.state.iter_mut()) {
+            if !st[..nst].iter().all(|v| v.is_finite()) {
+                st.fill(0.0);
+                buf[..frames].fill(0.0);
+            }
         }
     }
 }
@@ -715,5 +734,60 @@ mod tests {
         // Flat is 12 sections at 0 dB: transparent up to f32 rounding.
         assert!(a[..4].iter().all(|&v| (v - 0.25).abs() < 1e-6), "{a:?}");
         assert!(a[4..].iter().all(|&v| v.abs() < 1e-6), "{a:?}");
+    }
+}
+
+#[cfg(test)]
+mod non_finite_tests {
+    use super::*;
+
+    /// One bad sample from any app must not silence the EQ for good. NaN
+    /// and Inf count as 0; a huge finite sample that
+    /// overflows the filters resets that channel. The other channel is
+    /// never affected.
+    #[test]
+    fn one_nan_or_inf_sample_does_not_kill_the_stream() {
+        let mut s = HpEqSettings::flat(EqMode::Advanced);
+        s.advanced = [3.0, -2.0, 6.0, 0.0, -4.0, 2.0, 1.0, -1.0, 5.0, -6.0];
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 3.0e38] {
+            let mut eq = HeadphoneEq::<IppF32>::new(&s);
+            let mut clean = HeadphoneEq::<IppF32>::new(&s);
+            eq.prepare(48_000, 8192);
+            clean.prepare(48_000, 8192);
+            let sig: Vec<f32> = (0..3 * 48_000)
+                .map(|i| (i as f32 * 0.01).sin() * 0.5)
+                .collect();
+            let mut worst_late = 0.0f32;
+            for (b, x) in sig.chunks(256).enumerate() {
+                let mut l = x.to_vec();
+                let mut r = x.to_vec();
+                // The clean EQ gets 0 where the bad sample was.
+                let mut rc = x.to_vec();
+                let mut lc = x.to_vec();
+                if b == 10 {
+                    l[17] = bad;
+                    lc[17] = 0.0;
+                }
+                eq.process_in_place(&mut [&mut l, &mut r]);
+                clean.process_in_place(&mut [&mut lc, &mut rc]);
+                assert!(
+                    l.iter().chain(&r).all(|v| v.is_finite()),
+                    "{bad}: non-finite output in block {b}"
+                );
+                assert_eq!(r, rc, "{bad}: the other channel changed in block {b}");
+                if !bad.is_finite() {
+                    assert_eq!(l, lc, "{bad}: not the same as a 0 sample, block {b}");
+                } else if b >= 375 {
+                    for (a, c) in l.iter().zip(&lc) {
+                        worst_late = worst_late.max((a - c).abs());
+                    }
+                }
+            }
+            // From 2 s on, the reset channel has caught up. Not bit for bit:
+            // two f32 cascades started from different states keep differing
+            // by their rounding noise, which the low bands (poles close to
+            // the unit circle) amplify to about 5e-4 here.
+            assert!(worst_late < 2e-3, "{bad}: still {worst_late} off");
+        }
     }
 }

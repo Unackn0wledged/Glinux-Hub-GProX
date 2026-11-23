@@ -34,11 +34,15 @@ enum Cmd {
     /// Blue VO!CE (mic chain).
     #[command(subcommand)]
     Bluevoice(BvCmd),
-    /// Set the headset's sidetone (mic monitoring) level.
+    /// Set the headset's sidetone (mic monitoring) level, or switch
+    /// always-on sidetone on or off.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Sidetone {
         /// 0–100.
-        #[arg(value_parser = clap::value_parser!(u8).range(0..=100))]
-        level: u8,
+        #[arg(required = true, value_parser = clap::value_parser!(u8).range(0..=100))]
+        level: Option<u8>,
+        #[command(subcommand)]
+        mode: Option<SidetoneCmd>,
     },
     /// Set the headset's auto-off timer.
     AutoOff {
@@ -54,6 +58,23 @@ enum Cmd {
     /// your G HUB install into ~/.config/gprox, and make the gprox devices
     /// your default output and input (no running gproxd needed).
     Setup(setup::SetupArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum SidetoneCmd {
+    /// Keep the headset's mic stream open so sidetone works even when no app
+    /// uses the mic (the headset only mixes sidetone while the mic streams).
+    /// Off by default.
+    AlwaysOn {
+        #[arg(value_enum)]
+        state: OnOff,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OnOff {
+    On,
+    Off,
 }
 
 #[derive(Debug, Subcommand)]
@@ -177,7 +198,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             };
             show(&client.call(&req)?, json)?;
         }
-        Cmd::Sidetone { level } => show(&client.call(&Request::SetSidetone { level })?, json)?,
+        Cmd::Sidetone { level, mode } => {
+            let req = match (level, mode) {
+                (_, Some(SidetoneCmd::AlwaysOn { state })) => Request::SetAlwaysOnSidetone {
+                    on: state == OnOff::On,
+                },
+                (Some(level), None) => Request::SetSidetone { level },
+                (None, None) => unreachable!("clap requires a level or a subcommand"),
+            };
+            show(&client.call(&req)?, json)?
+        }
         Cmd::AutoOff { minutes } => show(&client.call(&Request::SetAutoOff { minutes })?, json)?,
         Cmd::Bluevoice(c) => {
             let req = match c {
@@ -225,6 +255,39 @@ mod tests {
             assert!(Cli::try_parse_from(args).unwrap().json, "{args:?}");
         }
         assert!(!Cli::try_parse_from(["gprox", "status"]).unwrap().json);
+    }
+
+    #[test]
+    fn sidetone_level_or_always_on() {
+        let parse = |args: &[&str]| {
+            let mut v = vec!["gprox", "sidetone"];
+            v.extend_from_slice(args);
+            Cli::try_parse_from(v).map(|c| match c.cmd {
+                Cmd::Sidetone { level, mode } => {
+                    (level, mode.map(|SidetoneCmd::AlwaysOn { state }| state))
+                }
+                other => panic!("{other:?}"),
+            })
+        };
+        assert_eq!(parse(&["30"]).unwrap(), (Some(30), None));
+        assert_eq!(parse(&["0"]).unwrap(), (Some(0), None));
+        assert_eq!(
+            parse(&["always-on", "on"]).unwrap(),
+            (None, Some(OnOff::On))
+        );
+        assert_eq!(
+            parse(&["always-on", "off"]).unwrap(),
+            (None, Some(OnOff::Off))
+        );
+        for bad in [
+            &[][..],
+            &["101"],
+            &["always-on"],
+            &["always-on", "maybe"],
+            &["30", "always-on", "on"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
