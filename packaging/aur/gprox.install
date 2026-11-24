@@ -6,10 +6,13 @@ post_install() {
   cat <<'MSG'
 ==> gprox: gproxd starts at your next login. To start it now:
 ==>     systemctl --user start gproxd
-==> One-time setup (Blue VO!CE presets and battery percentage from your own
-==> G HUB install, and gprox as the default output and input):
+==> One-time setup, needs files from a Windows G HUB install (Blue VO!CE
+==> presets, battery percentage; also makes gprox the default output and input):
 ==>     gprox setup /path/to/LGHUB/depots/<number>/pro_headset
+==> Without them, pick "PRO X (gprox)" and "PRO X Mic (gprox)" in your sound settings.
 ==> Your own G HUB presets: gprox import ghub /path/to/settings.db
+==> Tray widget (KDE): Configure System Tray -> Entries -> gprox Headset.
+==> Full steps: https://github.com/Unackn0wledged/Glinux-Hub-GProX#setup
 MSG
 }
 
