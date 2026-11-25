@@ -8,7 +8,7 @@
         "Id": "org.gprox.tray",
         "License": "LicenseRef-unknown",
         "Name": "gprox Headset",
-        "Version": "0.1.1"
+        "Version": "0.1.2"
     },
     "X-Plasma-API-Minimum-Version": "6.0",
     "X-Plasma-NotificationArea": "true",

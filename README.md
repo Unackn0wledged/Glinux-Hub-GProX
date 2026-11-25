@@ -36,11 +36,11 @@ Download the package from the [latest release](https://github.com/Unackn0wledged
 (the release notes list its SHA-256) and install it. pacman installs the dependencies:
 
 ```bash
-curl -LO https://github.com/Unackn0wledged/Glinux-Hub-GProX/releases/download/v0.1.1/gprox-0.1.1-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/Unackn0wledged/Glinux-Hub-GProX/releases/download/v0.1.2/gprox-0.1.2-1-x86_64.pkg.tar.zst
 ```
 
 ```bash
-sudo pacman -U gprox-0.1.1-1-x86_64.pkg.tar.zst
+sudo pacman -U gprox-0.1.2-1-x86_64.pkg.tar.zst
 ```
 
 Or build it from source (needs `rustup`, `clang` and `pkgconf`): clone this repository, then run `makepkg -si` in
@@ -99,9 +99,6 @@ They are gprox's own settings, not copies of G HUB presets. The EQ presets only 
 has no pre-gain and a boost would clip loud material at full volume. So they play a little quieter than `flat` (Music
 about 1 dB, FPS about 3, Movies about 5). Turning Blue VO!CE on without a preset picks gprox Natural. To make your own
 variant, edit one in `gprox-gui` and save it under a new name; the built-in presets themselves can't be changed.
-
-The built-in presets and preset editing are on `main` and come with the next release. Until then, build from a clone:
-`makepkg -si` in `packaging/arch`.
 
 ## Usage
 

@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "gprox-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "gprox-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "gprox-daemon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1101,7 +1101,7 @@ dependencies = [
 
 [[package]]
 name = "gprox-dsp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "gprox-core",
  "realfft",
@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "gprox-ghub"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "gprox-core",
  "gprox-dsp",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "gprox-gui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "eframe",
  "gprox-core",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "gprox-hid"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "gprox-core",
  "serde_json",
@@ -1142,7 +1142,7 @@ dependencies = [
 
 [[package]]
 name = "gprox-pw"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytemuck",
  "gprox-dsp",
