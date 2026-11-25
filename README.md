@@ -2,15 +2,15 @@
 
 G HUB's headphone EQ, Blue VO!CE mic chain and headset controls for the **Logitech G PRO X Wireless** on Linux.
 
-Unofficial and not affiliated with Logitech. No Logitech code, binaries or preset files are included. The source does
-contain numeric constants of G HUB's algorithms, its default Blue VO!CE values and one preset's values (Broadcaster 1) for the tests.
+Unofficial and not affiliated with Logitech. **No G HUB presets are included.** They are copied from your own G HUB install
+(see [Setup](#setup)).
 
 ![The tray widget in Plasma's light and dark themes](docs/tray.png)
 
 ## Features
 
-- **Headphone EQ:** G HUB's 10-band and 2-band EQ, with its presets.
-- **Blue VO!CE:** the full mic chain (EQ, noise reduction, gate, de-esser, compressor, limiter) with G HUB's presets and your own.
+- **Headphone EQ:** G HUB's 10-band and 2-band EQ.
+- **Blue VO!CE:** the full mic chain (EQ, noise reduction, gate, de-esser, compressor, limiter) using the presets from your G HUB install.
 - **Headset controls:** sidetone (optionally always on), auto-off timer, battery level and mic mute state.
 - **Import** of your own presets from G HUB.
 - A KDE Plasma 6 tray widget, a small GUI and a command-line tool.
@@ -84,7 +84,7 @@ gprox status
 ```
 
 ```bash
-gprox preset set bass
+gprox preset list
 ```
 
 ```bash
