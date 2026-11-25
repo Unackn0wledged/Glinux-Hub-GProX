@@ -1,6 +1,6 @@
 pkgbase = gprox
 	pkgdesc = Headphone EQ, Blue VO!CE mic chain and headset controls for the Logitech PRO X Wireless (G HUB replacement)
-	pkgver = 0.1.1
+	pkgver = 0.1.2
 	pkgrel = 1
 	url = https://github.com/Unackn0wledged/Glinux-Hub-GProX
 	install = gprox.install
@@ -24,7 +24,7 @@ pkgbase = gprox
 	optdepends = libxcursor: gprox-gui on X11
 	optdepends = libxi: gprox-gui on X11
 	optdepends = libxrandr: gprox-gui on X11
-	source = gprox-0.1.1.tar.gz::https://github.com/Unackn0wledged/Glinux-Hub-GProX/archive/refs/tags/v0.1.1.tar.gz
-	sha256sums = 17e7cddfbee24ab8e7759ecfda727e76f9f4719f50a0c2805b35e71a23adbcfc
+	source = gprox-0.1.2.tar.gz::https://github.com/Unackn0wledged/Glinux-Hub-GProX/archive/refs/tags/v0.1.2.tar.gz
+	sha256sums = 381a3fa746f773be97e03c95f7c6c13df486b03c18f0dcc7ff9627086e127d52
 
 pkgname = gprox
