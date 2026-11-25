@@ -1,0 +1,8 @@
+# gprox Movies: sub/bass weight, clear dialogue, no harsh treble.
+# Every gain is a cut or 0 dB and
+# the summed response stays below -0.1 dB above 20 Hz (0 dB only towards
+# DC), so the EQ itself never clips.
+mode = "advanced"
+basic = [0.0, 0.0]
+#           32    64    125   250   500   1k    2k    4k    8k    16k
+advanced = [-0.5, -0.5, -3.0, -5.0, -6.0, -5.0, -3.5, -4.5, -8.5, -5.0]

@@ -17,13 +17,24 @@
 //! ← {"ok":{…,"headset":{"connected":true,"sidetone":30,…}}}
 //! → {"cmd":"set_always_on_sidetone","on":true}
 //! ← {"ok":{…,"headset":{…,"always_on_sidetone":true,"mic_kept_open":true}}}
+//! → {"cmd":"edit_hp_eq","preset":{"mode":"basic","basic":[3.0,0.0],"advanced":[…]}}
+//! ← {"ok":{"hp_eq":{"selected":"flat","modified":true,…},…}}
+//! → {"cmd":"edit_bluevoice","params":{"veq.low_gain":1.5,"comp.enable":1.0}}
+//! → {"cmd":"save_bluevoice","name":"Mine"}
 //! ```
+//!
+//! Editing: `edit_*` change the live settings
+//! without touching the selected preset's file; `save_*` write them as a user
+//! preset and select it; `delete_*` remove a user preset. The new status
+//! fields have serde defaults, so clients read older daemons.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -57,11 +68,32 @@ pub enum Request {
     /// app records, because the headset only mixes sidetone while it
     /// streams. No HID++ write; persisted.
     SetAlwaysOnSidetone { on: bool },
+    /// Replace the live headphone EQ settings (heard at once, 100 ms ramp)
+    /// without changing the selected preset's file. Each gain ±12 dB.
+    EditHpEq { preset: HeadphoneEqPreset },
+    /// Save the live headphone EQ settings as the user preset `name`
+    /// (overwriting a user preset of that name) and select it.
+    SaveHpEq { name: String },
+    /// Delete the user headphone EQ preset `name` (flat is selected if it
+    /// was the selected one).
+    DeleteHpEq { name: String },
+    /// Change some Blue VO!CE engine parameters of the live preset
+    /// (`"veq.low_gain": 1.5`), each inside `PARAM_RANGES`. Not
+    /// `micopt.enable`: that is [`Request::BluevoiceEnable`].
+    EditBluevoice { params: BTreeMap<String, f32> },
+    /// Save the live Blue VO!CE preset as the user preset `name` and select
+    /// it. Presets from G HUB are never overwritten.
+    SaveBluevoice { name: String },
+    /// Delete the user Blue VO!CE preset `name`.
+    DeleteBluevoice { name: String },
 }
 
 /// The daemon's answer: the status after the request, or an error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// One short-lived value per request; boxing the status would only change the
+// API for clients.
+#[allow(clippy::large_enum_variant)]
 pub enum Response {
     Ok(Status),
     Error(String),
@@ -181,19 +213,38 @@ pub struct HpEqStatus {
     pub preset: HeadphoneEqPreset,
     /// Available preset names, [`FLAT_PRESET`] first.
     pub presets: Vec<String>,
+    /// `preset` differs from the selected preset as saved (unsaved edits).
+    #[serde(default)]
+    pub modified: bool,
+    /// The user's own presets: may be saved over and deleted.
+    #[serde(default)]
+    pub writable: Vec<String>,
 }
 
 /// Blue VO!CE (capture path).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlueVoiceStatus {
-    /// Whether a G HUB preset file was loaded. Without one the mic path is a
-    /// pass-through and the other fields are empty.
+    /// Whether the mic path runs Blue VO!CE. Always true since gprox has
+    /// presets of its own; false only from an older gproxd without a G HUB
+    /// preset file (its mic path was a pass-through, the other fields empty).
     pub available: bool,
     pub enabled: bool,
     /// Selected preset (short name, e.g. `BROADCASTER_1`, `TSM Myth`).
     pub selected: Option<String>,
     /// Available presets, short names (built-in prefix removed), file order.
     pub presets: Vec<String>,
+    /// The live preset differs from the selected one (unsaved edits).
+    #[serde(default)]
+    pub modified: bool,
+    /// The user's own presets: may be saved over and deleted. Presets from G
+    /// HUB never are.
+    #[serde(default)]
+    pub writable: Vec<String>,
+    /// The live preset as a full set of engine parameters (engine defaults,
+    /// then the selected preset, then the edits), whether Blue VO!CE is on or
+    /// off. Empty when no preset is selected.
+    #[serde(default)]
+    pub params: BTreeMap<String, f32>,
 }
 
 /// Control-channel errors on the client side.
@@ -320,8 +371,80 @@ mod tests {
             panic!()
         };
         assert_eq!(s.headset, HeadsetStatus::default());
+        assert!(!s.hp_eq.modified && s.hp_eq.writable.is_empty());
+        assert!(!s.bluevoice.modified && s.bluevoice.writable.is_empty());
+        assert!(s.bluevoice.params.is_empty());
         let e = Response::Error("x".into());
         assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"error":"x"}"#);
+    }
+
+    /// The editing requests: wire format and
+    /// round trip, values bit-exact.
+    #[test]
+    fn editing_requests() {
+        let mut eq = HeadphoneEqPreset {
+            mode: crate::EqMode::Advanced,
+            basic: [1.5, -0.5],
+            ..Default::default()
+        };
+        eq.advanced[5] = 6.0;
+        eq.advanced[9] = -11.75;
+        let params: BTreeMap<String, f32> = [
+            ("veq.low_gain".to_owned(), 0.631_626_7_f32),
+            ("comp.enable".to_owned(), 1.0),
+            ("exp.thresh".to_owned(), -47.3),
+        ]
+        .into_iter()
+        .collect();
+        let reqs = [
+            Request::EditHpEq { preset: eq.clone() },
+            Request::SaveHpEq {
+                name: "My EQ".into(),
+            },
+            Request::DeleteHpEq {
+                name: "My EQ".into(),
+            },
+            Request::EditBluevoice {
+                params: params.clone(),
+            },
+            Request::SaveBluevoice {
+                name: "Mine".into(),
+            },
+            Request::DeleteBluevoice {
+                name: "Mine".into(),
+            },
+        ];
+        for r in &reqs {
+            let line = serde_json::to_string(r).unwrap();
+            assert!(!line.contains('\n'));
+            assert_eq!(
+                &serde_json::from_str::<Request>(&line).unwrap(),
+                r,
+                "{line}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&reqs[1]).unwrap(),
+            r#"{"cmd":"save_hp_eq","name":"My EQ"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(
+                r#"{"cmd":"edit_bluevoice","params":{"comp.enable":1,"exp.thresh":-47.3,"veq.low_gain":0.6316267}}"#
+            )
+            .unwrap(),
+            Request::EditBluevoice { params }
+        );
+        let Request::EditHpEq { preset } = serde_json::from_str::<Request>(
+            r#"{"cmd":"edit_hp_eq","preset":{"mode":"advanced","basic":[1.5,-0.5],"advanced":[0,0,0,0,0,6,0,0,0,-11.75]}}"#,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(preset, eq);
+        // Unknown fields in a preset are refused, as in preset files.
+        assert!(
+            serde_json::from_str::<Request>(r#"{"cmd":"edit_hp_eq","preset":{"gain":1}}"#).is_err()
+        );
     }
 
     #[test]
@@ -331,12 +454,22 @@ mod tests {
                 selected: FLAT_PRESET.into(),
                 preset: HeadphoneEqPreset::default(),
                 presets: vec![FLAT_PRESET.into(), "bass".into()],
+                modified: true,
+                writable: vec!["bass".into()],
             },
             bluevoice: BlueVoiceStatus {
                 available: true,
                 enabled: false,
                 selected: Some("BROADCASTER_1".into()),
-                presets: vec!["BROADCASTER_1".into()],
+                presets: vec!["BROADCASTER_1".into(), "Mine".into()],
+                modified: true,
+                writable: vec!["Mine".into()],
+                params: [
+                    ("veq.low_gain".to_owned(), 0.631_626_7_f32),
+                    ("comp.enable".to_owned(), 1.0),
+                ]
+                .into_iter()
+                .collect(),
             },
             headset: HeadsetStatus {
                 dongle: true,

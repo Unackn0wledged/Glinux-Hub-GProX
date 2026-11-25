@@ -1,20 +1,31 @@
 //! `gprox-gui`: a small, functional front-end for a running `gproxd`.
 //!
-//! Headphone EQ preset picker with the EQ's magnitude curve, Blue VO!CE on/off
-//! and preset picker, and the headset (battery, mic mute, sidetone, auto-off). Everything goes through the control socket
+//! Headphone EQ preset picker, the EQ's magnitude curve and its band sliders;
+//! Blue VO!CE on/off, preset picker and a slider per engine parameter; saving
+//! and deleting user presets; and the headset (battery, mic mute, sidetone,
+//! auto-off). Everything goes through the control socket
 //! (`gprox_core::control`); the GUI never touches audio. The curve uses the
 //! DSP's own coefficient design (`gprox_dsp::steady_state_taps`), so it shows
 //! exactly what the render path converges to.
 //!
+//! Editing: slider moves are sent while dragging, at
+//! most every [`EDIT_INTERVAL`], and the final value on release; gproxd ramps
+//! and smooths them like a preset switch. Until a change is acknowledged the
+//! GUI shows its own values (a "draft"), so the sliders and the curve follow
+//! the pointer without waiting for the daemon.
+//!
 //! `GPROX_GUI_SCREENSHOT=<file.ppm>`: save a screenshot of this window (only
 //! this window) shortly after start and exit. For docs and bug reports.
 
+mod bv_params;
+
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
-use gprox_core::HeadphoneEqPreset;
-use gprox_core::control::{Client, Request, Status};
+use gprox_core::control::{Client, ControlError, FLAT_PRESET, Request, Status};
+use gprox_core::{HeadphoneEqPreset, param_range};
 use gprox_dsp::hp_eq::{BAND_TABLE, BANDS};
 use gprox_dsp::{EqMode, HpEqSettings, biquad::Taps, cascade_magnitude_db, steady_state_taps};
 
@@ -26,13 +37,15 @@ const F_MIN: f64 = 20.0;
 const F_MAX: f64 = 20_000.0;
 const DB_RANGE: f64 = 15.0;
 const CURVE_POINTS: usize = 400;
+/// Shortest time between two live edits sent while a slider is dragged.
+const EDIT_INTERVAL: Duration = Duration::from_millis(50);
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("gprox")
             .with_app_id("gprox")
-            .with_inner_size([640.0, 640.0]),
+            .with_inner_size([720.0, 900.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -60,6 +73,41 @@ struct GproxApp {
     /// Pending self-screenshot (`GPROX_GUI_SCREENSHOT`).
     screenshot: Option<PathBuf>,
     started: Option<Instant>,
+    /// Kept-open connection to gproxd (re-opened when it breaks).
+    client: Option<Client>,
+    /// Headphone EQ values being edited, shown instead of the daemon's.
+    hp_draft: Option<HeadphoneEqPreset>,
+    /// `hp_draft` has changes gproxd hasn't got yet.
+    hp_unsent: bool,
+    /// Blue VO!CE values being edited, shown instead of the daemon's.
+    bv_draft: BTreeMap<String, f32>,
+    /// Edited Blue VO!CE values gproxd hasn't got yet.
+    bv_unsent: BTreeMap<String, f32>,
+    /// When the last live edit was sent.
+    last_edit: Option<Instant>,
+    /// Open dialog (save as, overwrite, delete).
+    dialog: Option<Dialog>,
+}
+
+/// Which preset family a dialog is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    HpEq,
+    BlueVoice,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Dialog {
+    SaveAs { kind: Kind, name: String },
+    Overwrite { kind: Kind, name: String },
+    Delete { kind: Kind, name: String },
+}
+
+/// Preset names as gproxd matches them: case-insensitive, spaces, dashes and
+/// underscores alike.
+fn same_name(a: &str, b: &str) -> bool {
+    let n = |s: &str| s.trim().to_lowercase().replace([' ', '-'], "_");
+    n(a) == n(b)
 }
 
 /// Write an image as binary PPM (no image crate needed).
@@ -95,14 +143,37 @@ fn curve_points(p: &HeadphoneEqPreset) -> Vec<(f64, f64)> {
 }
 
 impl GproxApp {
-    /// One request on a fresh connection (local socket; 2 s timeouts).
-    fn call(&mut self, req: Request) {
-        let r = Client::connect().and_then(|mut c| c.call(&req));
+    /// One request on the kept-open connection, or a new one if that is
+    /// gone (local socket; 2 s timeouts). A refused request keeps the
+    /// connection.
+    fn request(&mut self, req: &Request) -> Result<Status, ControlError> {
+        if let Some(c) = &mut self.client {
+            match c.call(req) {
+                Ok(s) => return Ok(s),
+                Err(e @ ControlError::Daemon(_)) => return Err(e),
+                // Broken (e.g. gproxd restarted, or closed an idle connection):
+                // gproxd didn't act on it, so try once more on a new one.
+                Err(_) => self.client = None,
+            }
+        }
+        let mut c = Client::connect()?;
+        let r = c.call(req);
+        if matches!(r, Ok(_) | Err(ControlError::Daemon(_))) {
+            self.client = Some(c);
+        }
+        r
+    }
+
+    /// Send a request; show its status, or its error. Returns whether it
+    /// was accepted.
+    fn call(&mut self, req: Request) -> bool {
+        let r = self.request(&req);
         self.last_refresh = Some(Instant::now());
         match r {
             Ok(s) => {
                 self.status = Some(s);
                 self.error = None;
+                true
             }
             Err(e) => {
                 // Keep showing the last state for a failed change; drop it when
@@ -111,43 +182,304 @@ impl GproxApp {
                     self.status = None;
                 }
                 self.error = Some(e.to_string());
+                false
+            }
+        }
+    }
+
+    /// Send the edits not sent yet: when `force`, or [`EDIT_INTERVAL`] after
+    /// the last one. Drafts are dropped once everything is sent and no
+    /// slider is held, so the daemon's state shows again.
+    fn flush_edits(&mut self, ctx: &egui::Context, force: bool) {
+        let due = force || self.last_edit.is_none_or(|t| t.elapsed() >= EDIT_INTERVAL);
+        if self.hp_unsent || !self.bv_unsent.is_empty() {
+            if !due {
+                ctx.request_repaint_after(EDIT_INTERVAL);
+                return;
+            }
+            self.last_edit = Some(Instant::now());
+            if self.hp_unsent
+                && let Some(preset) = self.hp_draft.clone()
+            {
+                self.hp_unsent = false;
+                if !self.call(Request::EditHpEq { preset }) {
+                    self.hp_draft = None;
+                }
+            }
+            if !self.bv_unsent.is_empty() {
+                let params = std::mem::take(&mut self.bv_unsent);
+                if !self.call(Request::EditBluevoice { params }) {
+                    self.bv_draft.clear();
+                }
+            }
+        }
+        if !ctx.input(|i| i.pointer.any_down()) {
+            if !self.hp_unsent {
+                self.hp_draft = None;
+            }
+            if self.bv_unsent.is_empty() {
+                self.bv_draft.clear();
+            }
+        }
+    }
+
+    /// "Revert", "Save", "Save as…" and "Delete" for the selected preset.
+    fn preset_buttons(
+        &mut self,
+        ui: &mut egui::Ui,
+        kind: Kind,
+        selected: Option<&str>,
+        modified: bool,
+        writable: &[String],
+    ) {
+        let own = selected.is_some_and(|n| writable.iter().any(|w| w == n));
+        ui.horizontal(|ui| {
+            if let Some(sel) = selected {
+                if modified {
+                    if ui
+                        .button("Revert")
+                        .on_hover_text("Drop the unsaved changes")
+                        .clicked()
+                    {
+                        self.discard_drafts();
+                        self.call(match kind {
+                            Kind::HpEq => Request::SetHpEq {
+                                name: sel.to_owned(),
+                            },
+                            Kind::BlueVoice => Request::SetBluevoice {
+                                name: sel.to_owned(),
+                            },
+                        });
+                    }
+                    if own
+                        && ui
+                            .button("Save")
+                            .on_hover_text(format!("Overwrite {sel:?}"))
+                            .clicked()
+                    {
+                        self.save(&ui.ctx().clone(), kind, sel.to_owned());
+                    }
+                }
+                if ui.button("Save as…").clicked() {
+                    let name = if own || sel == FLAT_PRESET {
+                        String::new()
+                    } else {
+                        format!("{sel} copy")
+                    };
+                    self.dialog = Some(Dialog::SaveAs { kind, name });
+                }
+                if own && ui.button("Delete").clicked() {
+                    self.dialog = Some(Dialog::Delete {
+                        kind,
+                        name: sel.to_owned(),
+                    });
+                }
+                if !own && sel != FLAT_PRESET {
+                    ui.weak("read-only preset: save a copy to keep changes");
+                }
+            }
+        });
+    }
+
+    fn discard_drafts(&mut self) {
+        self.hp_draft = None;
+        self.hp_unsent = false;
+        self.bv_draft.clear();
+        self.bv_unsent.clear();
+    }
+
+    /// Send pending edits, then save under `name`.
+    fn save(&mut self, ctx: &egui::Context, kind: Kind, name: String) {
+        self.flush_edits(ctx, true);
+        self.call(match kind {
+            Kind::HpEq => Request::SaveHpEq { name },
+            Kind::BlueVoice => Request::SaveBluevoice { name },
+        });
+    }
+
+    /// The modal dialog, if one is open.
+    fn dialog_ui(&mut self, ctx: &egui::Context, s: &Status) {
+        let Some(mut dialog) = self.dialog.clone() else {
+            return;
+        };
+        enum Act {
+            Keep,
+            Close,
+            Save(Kind, String),
+            Delete(Kind, String),
+        }
+        let mut act = Act::Keep;
+        let mut next = None;
+        let modal = egui::Modal::new(egui::Id::unique("gprox-dialog")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            match &mut dialog {
+                Dialog::SaveAs { kind, name } => {
+                    let (presets, writable) = match kind {
+                        Kind::HpEq => (&s.hp_eq.presets, &s.hp_eq.writable),
+                        Kind::BlueVoice => (&s.bluevoice.presets, &s.bluevoice.writable),
+                    };
+                    ui.heading("Save preset as");
+                    let r = ui.text_edit_singleline(name);
+                    if !r.has_focus() && !r.lost_focus() {
+                        r.request_focus();
+                    }
+                    let clash = presets.iter().find(|p| same_name(p, name));
+                    let read_only = clash.is_some_and(|c| !writable.contains(c));
+                    if read_only {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            "That name is a read-only preset (flat or from G HUB). Pick another.",
+                        );
+                    }
+                    let ok = !name.trim().is_empty() && !read_only;
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(ok, egui::Button::new("Save")).clicked() || (enter && ok)
+                        {
+                            match clash {
+                                Some(c) => {
+                                    next = Some(Dialog::Overwrite {
+                                        kind: *kind,
+                                        name: c.clone(),
+                                    })
+                                }
+                                None => act = Act::Save(*kind, name.trim().to_owned()),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            act = Act::Close;
+                        }
+                    });
+                }
+                Dialog::Overwrite { kind, name } => {
+                    ui.heading("Overwrite preset?");
+                    ui.label(format!(
+                        "{name:?} exists. Replace it with the current settings?"
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("Overwrite").clicked() {
+                            act = Act::Save(*kind, name.clone());
+                        }
+                        if ui.button("Cancel").clicked() {
+                            act = Act::Close;
+                        }
+                    });
+                }
+                Dialog::Delete { kind, name } => {
+                    ui.heading("Delete preset?");
+                    ui.label(format!("Delete {name:?}? Its file is removed."));
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            act = Act::Delete(*kind, name.clone());
+                        }
+                        if ui.button("Cancel").clicked() {
+                            act = Act::Close;
+                        }
+                    });
+                }
+            }
+        });
+        if let Some(d) = next {
+            dialog = d;
+        } else if modal.should_close() && matches!(act, Act::Keep) {
+            act = Act::Close;
+        }
+        match act {
+            Act::Keep => self.dialog = Some(dialog),
+            Act::Close => self.dialog = None,
+            Act::Save(kind, name) => {
+                self.dialog = None;
+                self.save(ctx, kind, name);
+            }
+            Act::Delete(kind, name) => {
+                self.dialog = None;
+                self.discard_drafts();
+                self.call(match kind {
+                    Kind::HpEq => Request::DeleteHpEq { name },
+                    Kind::BlueVoice => Request::DeleteBluevoice { name },
+                });
             }
         }
     }
 
     fn hp_eq_ui(&mut self, ui: &mut egui::Ui, s: &Status) {
         ui.heading("Headphone EQ");
+        let hp = &s.hp_eq;
         let mut pick = None;
         ui.horizontal(|ui| {
             ui.label("Preset");
+            let shown = if hp.modified || self.hp_draft.is_some() {
+                format!("{} (modified)", hp.selected)
+            } else {
+                hp.selected.clone()
+            };
             egui::ComboBox::from_id_salt("hp_eq")
-                .selected_text(&s.hp_eq.selected)
+                .selected_text(shown)
                 .width(220.0)
                 .show_ui(ui, |ui| {
-                    for n in &s.hp_eq.presets {
-                        if ui.selectable_label(*n == s.hp_eq.selected, n).clicked() {
+                    for n in &hp.presets {
+                        if ui.selectable_label(*n == hp.selected, n).clicked() {
                             pick = Some(n.clone());
                         }
                     }
                 });
-            let p = &s.hp_eq.preset;
-            ui.weak(match p.mode {
-                gprox_core::EqMode::Basic => format!(
-                    "basic: bass {:+.1} dB, treble {:+.1} dB",
-                    p.basic[0], p.basic[1]
-                ),
-                gprox_core::EqMode::Advanced => "advanced (10 band)".to_owned(),
-            });
         });
         if let Some(name) = pick {
+            self.discard_drafts();
             self.call(Request::SetHpEq { name });
+            return;
         }
-        let preset = &s.hp_eq.preset;
-        if self.curve.as_ref().is_none_or(|(p, _)| p != preset) {
-            self.curve = Some((preset.clone(), curve_points(preset)));
+        let modified = hp.modified || self.hp_draft.as_ref().is_some_and(|d| *d != hp.preset);
+        self.preset_buttons(ui, Kind::HpEq, Some(&hp.selected), modified, &hp.writable);
+
+        let mut p = self.hp_draft.clone().unwrap_or_else(|| hp.preset.clone());
+        let before = p.clone();
+        ui.horizontal(|ui| {
+            ui.label("Mode");
+            ui.radio_value(&mut p.mode, gprox_core::EqMode::Basic, "Basic (2 band)");
+            ui.radio_value(
+                &mut p.mode,
+                gprox_core::EqMode::Advanced,
+                "Advanced (10 band)",
+            );
+        });
+        if self.curve.as_ref().is_none_or(|(c, _)| *c != p) {
+            self.curve = Some((p.clone(), curve_points(&p)));
         }
-        if let Some((p, pts)) = &self.curve {
-            curve_view(ui, p, pts);
+        if let Some((c, pts)) = &self.curve {
+            curve_view(ui, c, pts);
+        }
+        let max = f64::from(HeadphoneEqPreset::MAX_GAIN_DB);
+        let (gains, labels): (&mut [f32], &[&str]) = match p.mode {
+            gprox_core::EqMode::Basic => (&mut p.basic, &HeadphoneEqPreset::BASIC_LABELS),
+            gprox_core::EqMode::Advanced => (&mut p.advanced, &HeadphoneEqPreset::ADVANCED_LABELS),
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = 130.0;
+            for (g, label) in gains.iter_mut().zip(labels) {
+                ui.vertical(|ui| {
+                    ui.set_width(58.0);
+                    let r = ui
+                        .add(
+                            egui::Slider::new(g, -max as f32..=max as f32)
+                                .vertical()
+                                .custom_formatter(fmt_tenths),
+                        )
+                        .on_hover_text("Double-click: 0 dB");
+                    if r.double_clicked() {
+                        *g = 0.0;
+                    }
+                    ui.small(*label);
+                });
+            }
+        });
+        if p != before {
+            // 0.1 dB steps, as exact as f32 allows (0.0 stays 0.0).
+            for g in p.basic.iter_mut().chain(p.advanced.iter_mut()) {
+                *g = (*g * 10.0).round() / 10.0;
+            }
+            self.hp_draft = Some(p);
+            self.hp_unsent = true;
         }
     }
 
@@ -165,7 +497,11 @@ impl GproxApp {
                 req = Some(Request::BluevoiceEnable { on });
             }
             ui.label("Preset");
-            let sel = bv.selected.as_deref().unwrap_or("(none)");
+            let sel = match (&bv.selected, bv.modified || !self.bv_draft.is_empty()) {
+                (Some(n), true) => format!("{n} (modified)"),
+                (Some(n), false) => n.clone(),
+                (None, _) => "(none)".to_owned(),
+            };
             egui::ComboBox::from_id_salt("bluevoice")
                 .selected_text(sel)
                 .width(220.0)
@@ -181,7 +517,135 @@ impl GproxApp {
                 });
         });
         if let Some(r) = req {
+            if matches!(r, Request::SetBluevoice { .. }) {
+                self.discard_drafts();
+            }
             self.call(r);
+            return;
+        }
+        if bv.params.is_empty() {
+            if bv.selected.is_some() {
+                ui.weak("This gproxd can't edit presets (update gproxd).");
+            }
+            return;
+        }
+        let modified = bv.modified
+            || self
+                .bv_draft
+                .iter()
+                .any(|(k, v)| bv.params.get(k) != Some(v));
+        self.preset_buttons(
+            ui,
+            Kind::BlueVoice,
+            bv.selected.as_deref(),
+            modified,
+            &bv.writable,
+        );
+        if !bv.enabled {
+            ui.weak("Blue VO!CE is off: changes are heard once it is on.");
+        }
+        let value = |app: &Self, name: &str| -> Option<f32> {
+            app.bv_draft
+                .get(name)
+                .or_else(|| bv.params.get(name))
+                .copied()
+        };
+        let mut changed: Vec<(&'static str, f32)> = Vec::new();
+        for m in bv_params::MODULES {
+            let title = match m.enable.and_then(|e| value(self, e)) {
+                Some(v) if v != 0.0 => format!("{} (on)", m.title),
+                Some(_) => format!("{} (off)", m.title),
+                None => m.title.to_owned(),
+            };
+            egui::CollapsingHeader::new(title)
+                .id_salt(m.title)
+                .default_open(false)
+                .show(ui, |ui| {
+                    if let Some(e) = m.enable
+                        && let Some(v) = value(self, e)
+                    {
+                        let mut on = v != 0.0;
+                        if ui.checkbox(&mut on, "On").changed() {
+                            changed.push((e, f32::from(u8::from(on))));
+                        }
+                    }
+                    egui::Grid::new(m.title)
+                        .num_columns(2)
+                        .min_col_width(130.0)
+                        .show(ui, |ui| {
+                            for prm in m.params {
+                                let (Some(v), Some((lo, hi))) =
+                                    (value(self, prm.name), param_range(prm.name))
+                                else {
+                                    continue;
+                                };
+                                ui.label(prm.label);
+                                if let Some(nv) = param_slider(ui, prm.unit, v, lo, hi)
+                                    && nv != v
+                                {
+                                    changed.push((prm.name, nv));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+        }
+        for (name, v) in changed {
+            self.bv_draft.insert(name.to_owned(), v);
+            self.bv_unsent.insert(name.to_owned(), v);
+        }
+    }
+}
+
+/// One decimal, without "-0.0".
+fn fmt_tenths(v: f64, _: std::ops::RangeInclusive<usize>) -> String {
+    let v = (v * 10.0).round() / 10.0;
+    format!("{:.1}", if v == 0.0 { 0.0 } else { v })
+}
+
+/// One Blue VO!CE parameter's control; the new value if it was changed.
+fn param_slider(ui: &mut egui::Ui, unit: bv_params::Unit, v: f32, lo: f32, hi: f32) -> Option<f32> {
+    use bv_params::Unit;
+    ui.spacing_mut().slider_width = 260.0;
+    match unit {
+        Unit::Switch => {
+            let mut on = v != 0.0;
+            ui.checkbox(&mut on, "")
+                .changed()
+                .then(|| f32::from(u8::from(on)))
+        }
+        Unit::LinDb { floor_db } => {
+            let (a, b) = bv_params::db_range(lo, hi, floor_db);
+            let mut db = bv_params::lin_to_db(v).clamp(a, b);
+            // Rounded to 0.1 dB here, not with step_by (which counts from
+            // the range's lower end, e.g. −15.000009 dB, so 0 dB would be
+            // sent as 0.99999).
+            let r = ui.add(
+                egui::Slider::new(&mut db, a..=b)
+                    .custom_formatter(fmt_tenths)
+                    .suffix(" dB"),
+            );
+            r.changed().then(|| {
+                let db = (db * 10.0).round() / 10.0;
+                bv_params::db_value_to_lin(db, lo, hi, floor_db)
+            })
+        }
+        _ => {
+            let mut x = v.clamp(lo, hi);
+            let (suffix, decimals, log) = match unit {
+                Unit::Db => (" dB", 1, false),
+                Unit::Hz => (" Hz", 0, true),
+                Unit::Ms => (" ms", if hi <= 10.0 { 2 } else { 1 }, false),
+                Unit::Ratio => (":1", 1, false),
+                _ => ("", 2, false),
+            };
+            let r = ui.add(
+                egui::Slider::new(&mut x, lo..=hi)
+                    .logarithmic(log)
+                    .fixed_decimals(decimals)
+                    .suffix(suffix),
+            );
+            r.changed().then(|| x.clamp(lo, hi))
         }
     }
 }
@@ -384,16 +848,21 @@ impl eframe::App for GproxApp {
         } else if self.screenshot.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
+        let ctx = ui.ctx().clone();
         egui::CentralPanel::default().show(ui, |ui| {
             match self.status.clone() {
                 Some(s) => {
-                    self.hp_eq_ui(ui, &s);
-                    ui.add_space(12.0);
-                    ui.separator();
-                    self.bluevoice_ui(ui, &s);
-                    ui.add_space(12.0);
-                    ui.separator();
-                    self.headset_ui(ui, &s);
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.hp_eq_ui(ui, &s);
+                        ui.add_space(12.0);
+                        ui.separator();
+                        self.bluevoice_ui(ui, &s);
+                        ui.add_space(12.0);
+                        ui.separator();
+                        self.headset_ui(ui, &s);
+                    });
+                    self.flush_edits(&ctx, false);
+                    self.dialog_ui(&ctx, &s);
                 }
                 None => {
                     ui.heading("gprox");

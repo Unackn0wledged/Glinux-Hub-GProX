@@ -1,0 +1,7 @@
+# gprox FPS: footsteps and positional cues. Low end tamed, 1.5-5 kHz lifted
+# relative to the rest, top octave down for long sessions.
+# Peak of the response -0.8 dB.
+mode = "advanced"
+basic = [0.0, 0.0]
+#           32    64    125   250   500   1k    2k    4k    8k    16k
+advanced = [-9.0, -7.5, -6.0, -4.5, -4.0, -3.0, -1.0, -0.5, -4.5, -4.0]

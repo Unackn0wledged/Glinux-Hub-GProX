@@ -3,7 +3,9 @@
 //! [`HeadphoneEqPreset`]: the G HUB headphone EQ.
 //!
 //! [`control`]: the gproxd control-socket protocol and client.
+//! [`builtin`]: gprox's own presets, built into the binaries.
 
+pub mod builtin;
 pub mod control;
 
 use serde::{Deserialize, Serialize};

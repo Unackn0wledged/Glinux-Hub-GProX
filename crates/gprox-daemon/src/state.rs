@@ -8,9 +8,19 @@
 //! battery_model = "/path/to/pro_x_wireless_headset_battery.xml"
 //! sidetone = 30                 # last sidetone level set through gprox
 //! always_on_sidetone = true     # keep the headset mic stream open
+//!
+//! [hp_eq_edit]                  # unsaved headphone EQ edits (GUI)
+//! mode = "basic"
+//! basic = [3.0, 0.0]
+//!
+//! [bluevoice_edit]              # unsaved Blue VO!CE edits: the live preset
+//! "veq.low_gain" = 1.5
 //! ```
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use gprox_core::HeadphoneEqPreset;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -30,6 +40,12 @@ pub struct State {
     /// Keep the headset's mic stream open so its sidetone works with no app
     /// recording. Off when missing.
     pub always_on_sidetone: bool,
+    /// Live headphone EQ settings that differ from the selected preset
+    /// (unsaved edits).
+    pub hp_eq_edit: Option<HeadphoneEqPreset>,
+    /// Live Blue VO!CE preset (all its parameters) when it differs from the
+    /// selected one.
+    pub bluevoice_edit: Option<BTreeMap<String, f32>>,
 }
 
 /// `$XDG_CONFIG_HOME/gprox`, else `$HOME/.config/gprox`.
@@ -84,6 +100,19 @@ mod tests {
             battery_model: Some("/x/battery.xml".into()),
             sidetone: Some(30),
             always_on_sidetone: true,
+            hp_eq_edit: Some(HeadphoneEqPreset {
+                mode: gprox_core::EqMode::Advanced,
+                basic: [3.0, -0.5],
+                advanced: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, -12.0],
+            }),
+            bluevoice_edit: Some(
+                [
+                    ("veq.low_gain".to_owned(), 0.631_626_7_f32),
+                    ("comp.enable".to_owned(), 1.0),
+                ]
+                .into_iter()
+                .collect(),
+            ),
         };
         s.save(&path).unwrap();
         assert_eq!(State::load(&path), s);

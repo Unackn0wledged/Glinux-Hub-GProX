@@ -88,6 +88,17 @@ enum PresetCmd {
         #[arg(required = true, num_args = 1..)]
         name: Vec<String>,
     },
+    /// Save the current headphone EQ settings (with edits made in the GUI)
+    /// as a preset, overwriting your own preset of that name, and select it.
+    Save {
+        #[arg(required = true, num_args = 1..)]
+        name: Vec<String>,
+    },
+    /// Delete one of your own headphone EQ presets.
+    Delete {
+        #[arg(required = true, num_args = 1..)]
+        name: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -96,9 +107,21 @@ enum BvCmd {
     On,
     /// Switch Blue VO!CE off.
     Off,
-    /// Select a Blue VO!CE preset (G HUB name, e.g. "broadcaster 1").
+    /// Select a Blue VO!CE preset (e.g. "gprox natural", or a G HUB name such as "broadcaster 1").
     Set {
         /// Preset name; several words are joined with spaces.
+        #[arg(required = true, num_args = 1..)]
+        name: Vec<String>,
+    },
+    /// Save the current Blue VO!CE settings (with edits made in the GUI) as
+    /// your own preset and select it. Presets from G HUB are never
+    /// overwritten: use another name.
+    Save {
+        #[arg(required = true, num_args = 1..)]
+        name: Vec<String>,
+    },
+    /// Delete one of your own Blue VO!CE presets.
+    Delete {
         #[arg(required = true, num_args = 1..)]
         name: Vec<String>,
     },
@@ -118,10 +141,20 @@ fn mark(selected: bool) -> &'static str {
     if selected { "*" } else { " " }
 }
 
+/// " (modified)" for a preset with unsaved edits.
+fn modified(m: bool) -> &'static str {
+    if m { " (modified)" } else { "" }
+}
+
 fn print_list(s: &Status) {
     println!("Headphone EQ presets:");
     for n in &s.hp_eq.presets {
-        println!(" {} {n}", mark(*n == s.hp_eq.selected));
+        let own = if s.hp_eq.writable.contains(n) {
+            "  (yours)"
+        } else {
+            ""
+        };
+        println!(" {} {n}{own}", mark(*n == s.hp_eq.selected));
     }
     let bv = &s.bluevoice;
     if !bv.available {
@@ -135,7 +168,12 @@ fn print_list(s: &Status) {
         if bv.enabled { "on" } else { "off" }
     );
     for n in &bv.presets {
-        println!(" {} {n}", mark(bv.selected.as_ref() == Some(n)));
+        let own = if bv.writable.contains(n) {
+            "  (yours)"
+        } else {
+            ""
+        };
+        println!(" {} {n}{own}", mark(bv.selected.as_ref() == Some(n)));
     }
 }
 
@@ -145,15 +183,20 @@ fn print_status(s: &Status) {
         gprox_core::EqMode::Basic => format!("basic {:?} dB", p.basic),
         gprox_core::EqMode::Advanced => format!("advanced {:?} dB", p.advanced),
     };
-    println!("Headphone EQ: {} ({gains})", s.hp_eq.selected);
+    println!(
+        "Headphone EQ: {}{} ({gains})",
+        s.hp_eq.selected,
+        modified(s.hp_eq.modified)
+    );
     let bv = &s.bluevoice;
     if !bv.available {
         println!("Blue VO!CE:   not available");
     } else {
         println!(
-            "Blue VO!CE:   {}, preset {}",
+            "Blue VO!CE:   {}, preset {}{}",
             if bv.enabled { "on" } else { "off" },
-            bv.selected.as_deref().unwrap_or("(none)")
+            bv.selected.as_deref().unwrap_or("(none)"),
+            modified(bv.modified)
         );
     }
     println!("Headset:      {}", s.headset.summary());
@@ -192,9 +235,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 print_list(&s);
             }
         }
-        Cmd::Preset(PresetCmd::Set { name }) => {
-            let req = Request::SetHpEq {
-                name: name.join(" "),
+        Cmd::Preset(c) => {
+            let req = match c {
+                PresetCmd::List => unreachable!("handled above"),
+                PresetCmd::Set { name } => Request::SetHpEq {
+                    name: name.join(" "),
+                },
+                PresetCmd::Save { name } => Request::SaveHpEq {
+                    name: name.join(" "),
+                },
+                PresetCmd::Delete { name } => Request::DeleteHpEq {
+                    name: name.join(" "),
+                },
             };
             show(&client.call(&req)?, json)?;
         }
@@ -214,6 +266,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 BvCmd::On => Request::BluevoiceEnable { on: true },
                 BvCmd::Off => Request::BluevoiceEnable { on: false },
                 BvCmd::Set { name } => Request::SetBluevoice {
+                    name: name.join(" "),
+                },
+                BvCmd::Save { name } => Request::SaveBluevoice {
+                    name: name.join(" "),
+                },
+                BvCmd::Delete { name } => Request::DeleteBluevoice {
                     name: name.join(" "),
                 },
             };

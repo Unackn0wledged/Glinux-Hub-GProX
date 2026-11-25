@@ -1,0 +1,7 @@
+# gprox Music: close to neutral with a slight warmth (a gentle downward
+# tilt of about 2.5 dB from the bass to the treble).
+# Response at or below -0.1 dB above 20 Hz.
+mode = "advanced"
+basic = [0.0, 0.0]
+#           32    64    125   250   500   1k    2k    4k    8k    16k
+advanced = [-0.5, -0.5, -0.5, -0.5, -1.0, -1.0, -1.5, -2.0, -3.5, -2.0]

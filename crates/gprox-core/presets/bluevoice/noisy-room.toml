@@ -1,0 +1,62 @@
+# gprox Noisy Room: strong noise reduction and a gate for fans, keyboards
+# and people in the room. Low rumble cut, intelligibility lifted.
+name = "gprox Noisy Room"
+
+[engine.micopt]
+enable = 1.0
+volume = 0.7
+
+[engine.dpop]
+enable = 1.0
+freq = 100.0
+
+[engine.nr]
+enable = 1.0
+sensitivity = 15.0
+bias = 3.5
+attenuation_max = -30.0
+release = 150.0
+
+[engine.exp]
+enable = 1.0
+thresh = -42.0
+ratio = 6.0
+attenuation_max = -40.0
+attack = 1.0
+release = 120.0
+hysteresis = 80.0
+thresh_auto_enable = 1.0
+thresh_auto_sense = 15.0
+
+[engine.des]
+enable = 1.0
+freq = 5500.0
+thresh = -3.0
+ratio = 5.0
+attack = 1.0
+release = 80.0
+
+[engine.veq]
+enable = 1.0
+low_freq = 160.0
+low_width = 1.0
+low_gain = 0.7943282   # -2 dB
+mid_freq = 2000.0
+mid_width = 0.9
+mid_gain = 1.4125376   # +3 dB
+high_freq = 6500.0
+high_width = 1.0
+high_gain = 0.8912509  # -1 dB
+
+[engine.comp]
+enable = 1.0
+thresh = -30.0
+ratio = 3.0
+attack = 4.0
+release = 140.0
+makeup = 3.5481339     # +11 dB
+
+[engine.lim]
+boost = 3.9810717      # +12 dB
+attack = 4.0
+release = 150.0

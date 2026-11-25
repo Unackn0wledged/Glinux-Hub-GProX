@@ -25,3 +25,10 @@ path = "tests/golden/nr.rs"
 
 [dependencies]
 realfft = "3"
+
+[dev-dependencies]
+gprox-core.workspace = true
+
+[[test]]
+name = "builtin_presets"
+path = "tests/builtin_presets.rs"

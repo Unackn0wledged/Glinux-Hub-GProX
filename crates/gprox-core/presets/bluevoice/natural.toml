@@ -1,0 +1,64 @@
+# gprox Natural: a clear, natural voice. Light noise reduction, a gentle
+# expander for room tone between words, gentle compression.
+# Units as in gprox-core BlueVoicePreset
+# (voice-EQ gains and lim.boost linear; comp.makeup linear).
+name = "gprox Natural"
+
+[engine.micopt]
+enable = 1.0
+volume = 0.7
+
+[engine.dpop]
+enable = 1.0
+freq = 75.0
+
+[engine.nr]
+enable = 1.0
+sensitivity = 6.0
+bias = 2.0
+attenuation_max = -15.0
+release = 150.0
+
+[engine.exp]
+enable = 1.0
+thresh = -50.0
+ratio = 2.0
+attenuation_max = -12.0
+attack = 2.0
+release = 200.0
+hysteresis = 50.0
+thresh_auto_enable = 0.0
+thresh_auto_sense = 20.0
+
+[engine.des]
+enable = 1.0
+freq = 6000.0
+thresh = 3.0
+ratio = 3.0
+attack = 1.0
+release = 80.0
+
+[engine.veq]
+enable = 1.0
+low_freq = 150.0
+low_width = 1.0
+low_gain = 0.8413951   # -1.5 dB
+mid_freq = 2800.0
+mid_width = 1.0
+mid_gain = 1.1885022   # +1.5 dB
+high_freq = 4500.0
+high_width = 1.0
+high_gain = 1.1885022  # +1.5 dB
+
+[engine.comp]
+enable = 1.0
+thresh = -30.0
+ratio = 2.5
+attack = 5.0
+release = 150.0
+makeup = 2.8183829     # +9 dB
+
+[engine.lim]
+boost = 3.9810717      # +12 dB
+attack = 5.0
+release = 200.0

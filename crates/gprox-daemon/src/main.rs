@@ -1,9 +1,9 @@
 //! gproxd: creates the gprox virtual sink and source and runs their DSP.
 //!
 //! Render path: G HUB's headphone EQ, always running; the "flat" preset
-//! is all 0 dB. Capture path: the Blue VO!CE chain when a G HUB
-//! preset file is known (`--ghub-presets`, remembered), otherwise a bit-exact
-//! pass-through. Presets are switched at runtime over the control socket
+//! is all 0 dB. Capture path: the Blue VO!CE chain, with gprox's own
+//! presets ([`gprox_core::builtin`]), G HUB's (`--ghub-presets`, remembered)
+//! and imported ones. Presets are switched at runtime over the control socket
 //! ([`control`], used by `gprox` and `gprox-gui`); the last selection is
 //! persisted in `<config dir>/state.toml` and restored at start.
 //!
@@ -374,19 +374,24 @@ fn instance_lock(args: &Args) -> anyhow::Result<InstanceLock> {
     Ok(InstanceLock(files))
 }
 
-/// Blue VO!CE presets: G HUB's built-in ones first, then imported ones not
-/// already listed.
+/// Blue VO!CE presets: gprox's own first, then G HUB's built-in ones, then
+/// imported ones, each only if its name isn't already listed (so gprox's own
+/// can't be replaced).
 fn all_bluevoice_presets(files: &GhubFiles, config_dir: &Path) -> Vec<BlueVoicePreset> {
-    // A damaged G HUB file must not stop gproxd: the imported presets and
-    // the EQ work without it.
-    let mut presets = match &files.presets {
+    let mut presets = gprox_core::builtin::bluevoice_presets();
+    // A damaged G HUB file must not stop gproxd: the other presets and the
+    // EQ work without it.
+    let ghub = match &files.presets {
         Some(p) => read_bluevoice_presets(p).unwrap_or_else(|e| {
             tracing::warn!(error = %format!("{e:#}"), "G HUB Blue VO!CE presets not used");
             Vec::new()
         }),
         None => Vec::new(),
     };
-    for p in read_bluevoice_dir(&config_dir.join("bluevoice")) {
+    for p in ghub
+        .into_iter()
+        .chain(read_bluevoice_dir(&config_dir.join("bluevoice")))
+    {
         if !presets.iter().any(|q| control::bv_matches(q, &p.name)) {
             presets.push(p);
         }
@@ -446,6 +451,7 @@ fn controller(args: &Args) -> anyhow::Result<(Controller, GhubFiles)> {
             hp_dir: config_dir.join("hp-eq"),
             hp_extra,
             bv_presets,
+            bv_dir: config_dir.join("bluevoice"),
             state_path,
         },
         st,
@@ -725,6 +731,50 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// gprox's own Blue VO!CE preset names followed by `rest`.
+    fn with_builtins(rest: &[&str]) -> Vec<String> {
+        gprox_core::builtin::bluevoice_presets()
+            .into_iter()
+            .map(|p| p.name)
+            .chain(rest.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    /// Without any G HUB file or import, Blue VO!CE is available with
+    /// gprox's own presets, and an imported file can't replace one of them.
+    #[test]
+    fn builtin_bluevoice_presets_without_ghub() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("cfg");
+        let args =
+            Args::try_parse_from(["gproxd".as_ref(), "--config-dir".as_ref(), cfg.as_os_str()])
+                .unwrap();
+        let (mut ctl, _) = controller(&args).unwrap();
+        let s = ctl.status();
+        assert!(s.bluevoice.available && !s.bluevoice.enabled);
+        assert_eq!(s.bluevoice.presets, with_builtins(&[]));
+        assert!(ctl.bv_params().unwrap().is_ok());
+        // Turning it on picks the first one.
+        assert!(matches!(
+            ctl.handle(&Request::BluevoiceEnable { on: true }),
+            Response::Ok(_)
+        ));
+        assert_eq!(
+            ctl.status().bluevoice.selected.as_deref(),
+            Some("gprox Natural")
+        );
+
+        std::fs::create_dir_all(cfg.join("bluevoice")).unwrap();
+        std::fs::write(
+            cfg.join("bluevoice/gprox natural.toml"),
+            "[engine.micopt]\nvolume = 0.1\n",
+        )
+        .unwrap();
+        let p = all_bluevoice_presets(&GhubFiles::default(), &cfg);
+        assert_eq!(p.len(), 3);
+        assert_eq!(p[0], gprox_core::builtin::bluevoice_presets()[0]);
+    }
+
     #[test]
     fn only_44100_and_48000_are_accepted() {
         let rate = |r: &str| Args::try_parse_from(["gproxd", "--rate", r]).map(|a| a.rate);
@@ -773,12 +823,106 @@ mod tests {
         // Listing presets needs no lock and writes nothing.
         assert_eq!(
             list_bluevoice(&args(&["--list-bluevoice"])).unwrap(),
-            ["Mine"]
+            with_builtins(&["Mine"])
         );
         assert_eq!(std::fs::read_to_string(cfg.join("state.toml")).ok(), before);
         drop(first);
         let mut third = start(&args(&["--hp-eq", &bass])).unwrap();
         assert_eq!(third.1.status().hp_eq.selected, "Bass");
+    }
+
+    /// Edits and saves through the controller land on disk, and a controller
+    /// built from the config directory (state.toml, hp-eq/, bluevoice/) is
+    /// the same as the one that wrote them, unsaved edits included.
+    #[test]
+    fn saved_and_unsaved_edits_survive_a_restart_from_disk() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("cfg");
+        std::fs::create_dir_all(cfg.join("bluevoice")).unwrap();
+        let base = BlueVoicePreset::from_params(
+            "Base",
+            [
+                ("comp.enable", 1.0),
+                ("veq.enable", 1.0),
+                ("veq.low_gain", 1.0),
+            ],
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("bluevoice/Base.toml"),
+            base.to_toml_string().unwrap(),
+        )
+        .unwrap();
+        let args =
+            Args::try_parse_from(["gproxd", "--config-dir", &cfg.display().to_string()]).unwrap();
+        let (mut c, _) = controller(&args).unwrap();
+        let eq = |g: f32| gprox_core::HeadphoneEqPreset {
+            mode: gprox_core::EqMode::Advanced,
+            basic: [0.0, 0.0],
+            advanced: [0.0, g, 0.0, 0.0, 0.0, 6.5, 0.0, 0.0, -3.3, 0.0],
+        };
+        let bv = |v: f32| Request::EditBluevoice {
+            params: [
+                ("veq.low_gain".to_owned(), v),
+                ("comp.enable".to_owned(), 0.0),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let send = |c: &mut Controller, r: Request| match c.handle(&r) {
+            Response::Ok(s) => s,
+            Response::Error(e) => panic!("{r:?}: {e}"),
+        };
+        send(
+            &mut c,
+            Request::SetBluevoice {
+                name: "Base".into(),
+            },
+        );
+        send(&mut c, Request::BluevoiceEnable { on: true });
+        send(&mut c, bv(1.7));
+        send(
+            &mut c,
+            Request::SaveBluevoice {
+                name: "Mine".into(),
+            },
+        );
+        send(&mut c, Request::EditHpEq { preset: eq(1.9) });
+        send(
+            &mut c,
+            Request::SaveHpEq {
+                name: "My EQ".into(),
+            },
+        );
+        assert!(
+            cfg.join("bluevoice/Mine.toml").is_file() && cfg.join("hp-eq/My EQ.toml").is_file()
+        );
+
+        // Saved: a new controller is identical.
+        let (mut c2, _) = controller(&args).unwrap();
+        assert_eq!(c2.status(), c.status());
+        assert_eq!(c2.status().bluevoice.selected.as_deref(), Some("Mine"));
+        assert_eq!(c2.status().bluevoice.writable, ["Base", "Mine"]);
+        assert_eq!(c2.status().bluevoice.params["veq.low_gain"], 1.7);
+        assert_eq!(
+            c.bv_params().unwrap().unwrap(),
+            c2.bv_params().unwrap().unwrap()
+        );
+
+        // Unsaved edits on top: also identical after a restart.
+        send(&mut c, bv(2.1));
+        send(&mut c, Request::EditHpEq { preset: eq(-4.4) });
+        let (mut c3, _) = controller(&args).unwrap();
+        let (s, s3) = (c.status(), c3.status());
+        assert!(s3.bluevoice.modified && s3.hp_eq.modified);
+        assert_eq!(s3, s);
+        assert_eq!(s3.bluevoice.params["veq.low_gain"], 2.1);
+        assert_eq!(
+            c.bv_params().unwrap().unwrap(),
+            c3.bv_params().unwrap().unwrap()
+        );
+        assert_eq!(c.hp_settings().advanced, c3.hp_settings().advanced);
+        assert_eq!(c3.hp_settings().advanced[1], -4.4);
     }
 
     #[test]
@@ -879,7 +1023,11 @@ mod tests {
             ])
             .unwrap();
             let (mut ctl, _) = controller(&args).unwrap_or_else(|e| panic!("{body}: {e:#}"));
-            assert_eq!(ctl.status().bluevoice.presets, ["Mine"], "{body}");
+            assert_eq!(
+                ctl.status().bluevoice.presets,
+                with_builtins(&["Mine"]),
+                "{body}"
+            );
         }
     }
 
