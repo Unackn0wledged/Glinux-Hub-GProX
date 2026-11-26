@@ -35,7 +35,6 @@ struct SimState {
     sent_to: Vec<Option<u16>>,
     /// How many times the dongle was opened.
     opens: usize,
-    sink: Option<Sink>,
     /// Every write to the node fails (EPIPE) while the node stays.
     fail_writes: bool,
     /// (index, feature id); empty = [`TABLE`].
@@ -76,23 +75,23 @@ fn is_write(feature: Option<u16>, f: &[u8; REPORT_LEN]) -> bool {
 }
 
 #[derive(Clone, Default)]
-struct Sim(Arc<Mutex<SimState>>);
+struct Sim {
+    state: Arc<Mutex<SimState>>,
+    /// Where input reports go. Its own lock, held while delivering: the test
+    /// thread and the worker (replies) push concurrently, and each report
+    /// must arrive, in order, not be dropped while the other one delivers.
+    sink: Arc<Mutex<Option<Sink>>>,
+}
 
 impl Sim {
     fn with<R>(&self, f: impl FnOnce(&mut SimState) -> R) -> R {
-        f(&mut self.0.lock().unwrap())
+        f(&mut self.state.lock().unwrap())
     }
 
     fn push(&self, data: Incoming) {
-        let mut sink = self.with(|s| s.sink.take());
-        if let Some(k) = &mut sink {
+        if let Some(k) = self.sink.lock().unwrap().as_mut() {
             k(data);
         }
-        self.with(|s| {
-            if s.sink.is_none() {
-                s.sink = sink;
-            }
-        });
     }
 
     fn event(&self, mv: u16, flags: u8) {
@@ -107,7 +106,7 @@ impl Sim {
     fn unplug(&self) {
         self.with(|s| s.present = false);
         self.push(Err(std::io::Error::from_raw_os_error(19)));
-        self.with(|s| s.sink = None);
+        *self.sink.lock().unwrap() = None;
     }
 
     fn opener(&self) -> Opener {
@@ -116,10 +115,8 @@ impl Sim {
             if !sim.with(|s| s.present) {
                 return None;
             }
-            sim.with(|s| {
-                s.opens += 1;
-                s.sink = Some(sink);
-            });
+            sim.with(|s| s.opens += 1);
+            *sim.sink.lock().unwrap() = Some(sink);
             Some(Ok(Box::new(SimTransport(sim.clone())) as Box<dyn Transport>))
         })
     }
